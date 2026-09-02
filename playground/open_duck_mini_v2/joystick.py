@@ -36,6 +36,8 @@ from playground.common.rewards import (
     reward_tracking_ang_vel,
     cost_torques,
     cost_action_rate,
+    cost_action_rate_indexed,
+    cost_action_acceleration_indexed,
     cost_stand_still,
     reward_alive,
 )
@@ -44,6 +46,21 @@ from playground.open_duck_mini_v2.custom_rewards import reward_imitation
 # if set to false, won't require the reference data to be present and won't compute the reference motions polynoms for nothing
 USE_IMITATION_REWARD = True
 USE_MOTOR_SPEED_LIMITS = True
+
+# A/B toggle for the imitation reward (default value for the config flag below).
+# True  -> Disney BD-X leg/neck split (this branch's new behaviour): the neck is
+#          tracked in its own, heavily-weighted bucket AND the action-rate /
+#          action-acceleration smoothness penalties are split leg/neck.
+# False -> original head-excluded behaviour (single combined leg bucket + single
+#          combined action_rate). Use for A/B comparison against the deployed
+#          policy's training reward. See docs/animation_system_plan.md Appendix C.
+USE_LEG_NECK_SPLIT = True
+
+# Indices into the 14-DOF action / actuator vector (HW bus order, no antennas;
+# see open_duck_anim/joint_order.py HW_ORDER_14):
+#   0-4 left leg | 5-8 head/neck | 9-13 right leg
+LEG_ACTION_INDICES = (0, 1, 2, 3, 4, 9, 10, 11, 12, 13)
+NECK_ACTION_INDICES = (5, 6, 7, 8)
 
 
 def default_config() -> config_dict.ConfigDict:
@@ -79,12 +96,31 @@ def default_config() -> config_dict.ConfigDict:
                 tracking_lin_vel=2.5,
                 tracking_ang_vel=6.0,
                 torques=-1.0e-3,
+                # Combined action-rate bucket (original behaviour). Active only
+                # when use_leg_neck_split=False.
                 action_rate=-0.5,  # was -1.5
-                stand_still=-0.2,  # was -1.0 TODO try to relax this a bit ?
+                # Leg/neck-split smoothness penalties (Disney BD-X Table I).
+                # Active only when use_leg_neck_split=True. Neck is penalised
+                # 3-11x harder than the legs.
+                action_rate_leg=-1.5,
+                action_rate_neck=-5.0,
+                action_accel_leg=-0.45,
+                action_accel_neck=-5.0,
+                stand_still=-0.2,  # was -1.0 TODO try to relax this a bit ?
                 alive=20.0,
                 imitation=1.0,
             ),
             tracking_sigma=0.01,  # was working at 0.01
+            # Imitation (reference-motion) internal joint-tracking weights.
+            # Exposed here so they can be swept without editing custom_rewards.py.
+            # See docs/animation_system_plan.md Appendix C (Disney BD-X Table I).
+            imitation_config=config_dict.create(
+                use_leg_neck_split=USE_LEG_NECK_SPLIT,
+                w_joint_pos_leg=15.0,
+                w_joint_pos_neck=100.0,
+                w_joint_vel_leg=1.0e-3,
+                w_joint_vel_neck=1.0,
+            ),
         ),
         push_config=config_dict.create(
             enable=True,
@@ -157,6 +193,15 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
 
         self._njoints = self._mj_model.njnt  # number of joints
         self._actuators = self._mj_model.nu  # number of actuators
+
+        # Leg/neck action index arrays (into the 14-DOF action vector) for the
+        # split action-rate / action-acceleration smoothness penalties, plus the
+        # static A/B toggle read from config.
+        self._use_leg_neck_split = bool(
+            self._config.reward_config.imitation_config.use_leg_neck_split
+        )
+        self._leg_action_indices = jp.array(LEG_ACTION_INDICES)
+        self._neck_action_indices = jp.array(NECK_ACTION_INDICES)
 
         self._torso_body_id = self._mj_model.body(constants.ROOT_BODY).id
         self._torso_mass = self._mj_model.body_subtreemass[self._torso_body_id]
@@ -631,6 +676,10 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
     ) -> dict[str, jax.Array]:
         del metrics  # Unused.
 
+        ic = self._config.reward_config.imitation_config
+        split = self._use_leg_neck_split
+        zero = jp.array(0.0)
+
         ret = {
             "tracking_lin_vel": reward_tracking_lin_vel(
                 info["command"],
@@ -644,7 +693,45 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             ),
             # "orientation": cost_orientation(self.get_gravity(data)),
             "torques": cost_torques(data.actuator_force),
-            "action_rate": cost_action_rate(action, info["last_act"]),
+            # Action smoothness. Exactly one scheme is active (the other's buckets
+            # are held at 0) so the two can be A/B compared without changing obs.
+            "action_rate": (
+                zero if split else cost_action_rate(action, info["last_act"])
+            ),
+            "action_rate_leg": (
+                cost_action_rate_indexed(
+                    action, info["last_act"], self._leg_action_indices
+                )
+                if split
+                else zero
+            ),
+            "action_rate_neck": (
+                cost_action_rate_indexed(
+                    action, info["last_act"], self._neck_action_indices
+                )
+                if split
+                else zero
+            ),
+            "action_accel_leg": (
+                cost_action_acceleration_indexed(
+                    action,
+                    info["last_act"],
+                    info["last_last_act"],
+                    self._leg_action_indices,
+                )
+                if split
+                else zero
+            ),
+            "action_accel_neck": (
+                cost_action_acceleration_indexed(
+                    action,
+                    info["last_act"],
+                    info["last_last_act"],
+                    self._neck_action_indices,
+                )
+                if split
+                else zero
+            ),
             "alive": reward_alive(),
             "imitation": reward_imitation(  # FIXME, this reward is so adhoc...
                 self.get_floating_base_qpos(data.qpos),  # floating base qpos
@@ -655,6 +742,11 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
                 info["current_reference_motion"],
                 info["command"],
                 USE_IMITATION_REWARD,
+                split,
+                ic.w_joint_pos_leg,
+                ic.w_joint_pos_neck,
+                ic.w_joint_vel_leg,
+                ic.w_joint_vel_neck,
             ),
             "stand_still": cost_stand_still(
                 # info["command"], data.qpos[7:], data.qvel[6:], self._default_pose

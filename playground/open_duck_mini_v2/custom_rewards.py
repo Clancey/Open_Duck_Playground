@@ -10,7 +10,30 @@ def reward_imitation(
     reference_frame: jax.Array,
     cmd: jax.Array,
     use_imitation_reward: bool = False,
+    use_leg_neck_split: bool = True,
+    w_joint_pos_leg: float = 15.0,
+    w_joint_pos_neck: float = 100.0,
+    w_joint_vel_leg: float = 1.0e-3,
+    w_joint_vel_neck: float = 1.0,
 ) -> jax.Array:
+    """Imitation (reference-motion tracking) reward.
+
+    Two modes, selected by ``use_leg_neck_split`` (a *static* Python bool so the
+    branch is resolved at JIT-trace time, adding no runtime cost):
+
+    * ``False`` — the original Open Duck behaviour: the neck/head joints are
+      discarded and only the leg joints are tracked, with a single combined
+      position weight ``w_joint_pos_leg`` and velocity weight ``w_joint_vel_leg``.
+      This is the reward the currently deployed policy was trained with, and is
+      why it does not follow head commands (spike S0.1).
+    * ``True`` (default on this branch) — Disney BD-X Table I (arXiv:2501.05204)
+      leg/neck split: legs and neck are tracked in *separate* buckets so the neck
+      can be weighted much more heavily (``w_joint_pos_neck`` ~6.7x the leg
+      weight), which is what teaches head-command-following.
+
+    All weights are passed in from the env config (``reward_config.imitation_config``)
+    so they can be swept without editing this file.
+    """
     if not use_imitation_reward:
         return jp.nan_to_num(0.0)
 
@@ -23,8 +46,6 @@ def reward_imitation(
     w_lin_vel_z = 1.0
     w_ang_vel_xy = 0.5
     w_ang_vel_z = 0.5
-    w_joint_pos = 15.0
-    w_joint_vel = 1.0e-3
     w_contact = 1.0
 
     #  TODO : double check if the slices are correct
@@ -76,16 +97,35 @@ def reward_imitation(
     base_ang_vel = base_qvel[3:6]
 
     ref_joint_pos = reference_frame[joint_pos_slice_start:joint_pos_slice_end]
-    # remove neck head and antennas
-    ref_joint_pos = jp.concatenate([ref_joint_pos[:5], ref_joint_pos[11:]])
-    # joint_pos = joints_qpos
-    joint_pos = jp.concatenate([joints_qpos[:5], joints_qpos[9:]])
-
     ref_joint_vels = reference_frame[joint_vels_slice_start:joint_vels_slice_end]
-    # remove neck head and antennas
-    ref_joint_vels = jp.concatenate([ref_joint_vels[:5], ref_joint_vels[11:]])
-    # joint_vel = joints_qvel
-    joint_vel = jp.concatenate([joints_qvel[:5], joints_qvel[9:]])
+
+    # Joint-ordering map (see playground/common/poly_reference_motion.py:6-22 and
+    # open_duck_anim/joint_order.py, the tested single source of truth):
+    #
+    #   Reference frame is 16-DOF (authoring order):
+    #     0-4  left leg | 5 neck_pitch 6 head_pitch 7 head_yaw 8 head_roll |
+    #     9 left_antenna 10 right_antenna | 11-15 right leg
+    #   Simulation qpos/qvel is 14-DOF (NO antennas), same order minus antennas:
+    #     0-4  left leg | 5-8 head/neck | 9-13 right leg
+    #
+    # The antennas (reference indices 9,10) are NOT simulated joints -- they have
+    # no qpos/actuator counterpart -- so they are excluded from EVERY imitation
+    # bucket. They can never be tracked and including them would misalign the
+    # 16<->14 mapping. Hence the asymmetric slices below: legs drop 5:11 from the
+    # 16-DOF reference but 5:9 from the 14-DOF qpos.
+
+    # --- Leg bucket (indices 0:5 and, after dropping head+antennas, the right leg)
+    ref_leg_pos = jp.concatenate([ref_joint_pos[:5], ref_joint_pos[11:]])  # ref 16 -> 10 legs
+    leg_pos = jp.concatenate([joints_qpos[:5], joints_qpos[9:]])  # qpos 14 -> 10 legs
+    ref_leg_vel = jp.concatenate([ref_joint_vels[:5], ref_joint_vels[11:]])
+    leg_vel = jp.concatenate([joints_qvel[:5], joints_qvel[9:]])
+
+    # --- Neck/head bucket (neck_pitch, head_pitch, head_yaw, head_roll)
+    # indices 5:9 in BOTH the 16-DOF reference and the 14-DOF qpos.
+    ref_neck_pos = ref_joint_pos[5:9]
+    neck_pos = joints_qpos[5:9]
+    ref_neck_vel = ref_joint_vels[5:9]
+    neck_vel = joints_qvel[5:9]
 
     # ref_left_toe_pos = reference_frame[left_toe_pos_slice_start:left_toe_pos_slice_end]
     # ref_right_toe_pos = reference_frame[right_toe_pos_slice_start:right_toe_pos_slice_end]
@@ -124,8 +164,21 @@ def reward_imitation(
         * w_ang_vel_z
     )
 
-    joint_pos_rew = -jp.sum(jp.square(joint_pos - ref_joint_pos)) * w_joint_pos
-    joint_vel_rew = -jp.sum(jp.square(joint_vel - ref_joint_vels)) * w_joint_vel
+    # Joint tracking: leg and neck buckets. Disney BD-X weights the neck position
+    # error ~6.7x the leg error (Table I). When the split is disabled we fall back
+    # to the original head-excluded behaviour (leg bucket only).
+    leg_pos_rew = -jp.sum(jp.square(leg_pos - ref_leg_pos)) * w_joint_pos_leg
+    leg_vel_rew = -jp.sum(jp.square(leg_vel - ref_leg_vel)) * w_joint_vel_leg
+    neck_pos_rew = -jp.sum(jp.square(neck_pos - ref_neck_pos)) * w_joint_pos_neck
+    neck_vel_rew = -jp.sum(jp.square(neck_vel - ref_neck_vel)) * w_joint_vel_neck
+
+    if use_leg_neck_split:
+        joint_pos_rew = leg_pos_rew + neck_pos_rew
+        joint_vel_rew = leg_vel_rew + neck_vel_rew
+    else:
+        # Original behaviour: neck/head discarded entirely.
+        joint_pos_rew = leg_pos_rew
+        joint_vel_rew = leg_vel_rew
 
     ref_foot_contacts = jp.where(
         ref_foot_contacts > 0.5,

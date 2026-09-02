@@ -79,6 +79,35 @@ def cost_action_rate(act: jax.Array, last_act: jax.Array) -> jax.Array:
     return c1
 
 
+def cost_action_rate_indexed(
+    act: jax.Array, last_act: jax.Array, indices: jax.Array
+) -> jax.Array:
+    """First-difference (action-rate) penalty restricted to ``indices``.
+
+    Used to split the smoothness penalty into separate leg / neck buckets so the
+    neck can be penalised much more heavily (Disney BD-X Table I). ``indices`` is
+    a static index array into the 14-DOF action vector.
+    """
+    diff = act - last_act
+    return jp.nan_to_num(jp.sum(jp.square(diff[indices])))
+
+
+def cost_action_acceleration_indexed(
+    act: jax.Array,
+    last_act: jax.Array,
+    last_last_act: jax.Array,
+    indices: jax.Array,
+) -> jax.Array:
+    """Second-difference (action-acceleration) penalty restricted to ``indices``.
+
+    Uses the discrete second difference ``a_t - 2 a_{t-1} + a_{t-2}`` (both
+    ``last_act`` and ``last_last_act`` already live in ``info`` and feed the
+    observation, so no new state is introduced). Split into leg / neck buckets.
+    """
+    accel = act - 2.0 * last_act + last_last_act
+    return jp.nan_to_num(jp.sum(jp.square(accel[indices])))
+
+
 # Other rewards.
 
 
