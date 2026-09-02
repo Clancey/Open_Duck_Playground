@@ -49,28 +49,59 @@ USE_IMITATION_REWARD = True
 USE_MOTOR_SPEED_LIMITS = True
 
 # A/B toggle for the imitation reward (default value for the config flag below).
-# True  -> Disney BD-X leg/neck split (this branch's new behaviour): the neck is
+# True  -> Disney BD-X leg/neck split (iteration 1/2 behaviour): the neck is
 #          tracked in its own, heavily-weighted bucket AND the action-rate /
 #          action-acceleration smoothness penalties are split leg/neck.
 # False -> original head-excluded behaviour (single combined leg bucket + single
-#          combined action_rate). Use for A/B comparison against the deployed
-#          policy's training reward. See docs/animation_system_plan.md Appendix C.
-USE_LEG_NECK_SPLIT = True
+#          combined action_rate). This is the ORIGINAL deployed-policy reward and
+#          the ITERATION 3 default -- see HEAD_PASSTHROUGH below.
+USE_LEG_NECK_SPLIT = False
 
-# ITERATION 2 head-command fix (default ON for this branch). Enables the whole
-# head-command-following package so it can be A/B compared against the iteration-1
-# behaviour (which tracked the walking clip and measured DC gain ~=0 in spike
-# S0.1). When True:
+# ITERATION 2 head-command fix. Superseded by iteration 3 and OFF by default now.
+# When True:
 #   * the imitation neck bucket tracks the head command cmd[3:7] instead of the
 #     clip (walking regime) -- see custom_rewards.reward_imitation;
-#   * a dedicated `head_command` cost tracks cmd[3:7] while standing (the regime
-#     where the imitation reward is gated off);
-#   * sample_command decouples head zeroing from locomotion zeroing and injects
-#     explicit standing episodes, so "stand still + move head" is actually trained
-#     (it never was before), and the head command is resampled more frequently.
-# When False: iteration-1 behaviour (clip-tracking neck, no head_command term,
-# original 10%-zero-everything sampling).
-HEAD_COMMAND_TRACKING = True
+#   * a dedicated `head_command` cost tracks cmd[3:7] while standing;
+#   * decoupled head/locomotion sampling + faster head resample.
+# Iterations 1 and 2 both measured DC gain ~=0 in spike S0.1: a reward that asks
+# the *walking policy* to learn head-command-following is a credit-assignment /
+# signal-to-noise dead end -- the head is a tiny low-authority appendage whose
+# marginal reward is buried under locomotion + domain-randomisation + push
+# variance (PPO normalises advantages, so a large static weight does not help).
+HEAD_COMMAND_TRACKING = False
+
+# ITERATION 3 (default ON for this branch): HEAD PASSTHROUGH DURING TRAINING.
+#
+# Root-cause conclusion from iterations 1 and 2: the head was never meant to be
+# *learned* by the walking policy. The deployed runtime drives the head
+# ADDITIVELY on top of the policy's motor targets
+# (v2_rl_walk_mujoco.py:310-311: motor_targets[5:9] = command[3:7] +
+# motor_targets[5:9]); the passthrough was even sketched in this file
+# (the old commented `motor_targets.at[5:9].set(command[3:])`). That additive
+# path is the CORRECT architecture, not a defect.
+#
+# The remaining problem is sim2real fidelity/safety: the policy has never, during
+# training, experienced its head being driven externally through the full
+# commanded range, so spike S0.1 found the additive path topples the robot at
+# head deflections well inside the trained command range, forcing a very
+# conservative safe envelope (open_duck_anim/envelope.py).
+#
+# When True: the additive head passthrough is applied *during training* exactly as
+# the runtime applies it, so the legs must learn to balance while the head is
+# driven through its full randomised command range. The imitation/head reward is
+# reverted to the ORIGINAL baseline (leg-only imitation, single action_rate, no
+# head_command term) -- the head is now driven, not rewarded. Goal: WIDEN the safe
+# head operating envelope. It is NOT to make S0.1 `policy_only` gain pass (with a
+# passthrough that is ~1.0 by construction and proves nothing about learning).
+#
+# When False: original baseline -- no passthrough, head-excluded reward -- i.e.
+# "train without head disturbance", the A/B counterpart.
+HEAD_PASSTHROUGH = True
+
+# Disturbance-rich head sampling (decoupled head/locomotion zeroing + fast head
+# resample) is needed whenever the head is being commanded during training, i.e.
+# for both the iteration-2 reward path and the iteration-3 passthrough path.
+HEAD_DISTURBANCE_SAMPLING = HEAD_COMMAND_TRACKING or HEAD_PASSTHROUGH
 
 # Indices into the 14-DOF action / actuator vector (HW bus order, no antennas;
 # see open_duck_anim/joint_order.py HW_ORDER_14):
@@ -125,11 +156,10 @@ def default_config() -> config_dict.ConfigDict:
                 stand_still=-0.2,  # was -1.0 TODO try to relax this a bit ?
                 alive=20.0,
                 imitation=1.0,
-                # Standing-regime head-command tracking (iteration-2). Active only
-                # when ||cmd[:3]|| < 0.01; during walking the imitation neck bucket
-                # (retargeted to the command) does the tracking instead. Set to 0
-                # to disable.
-                head_command=-3.0,
+                # Standing-regime head-command tracking (iteration-2, now OFF by
+                # default). Iteration 3 drives the head via passthrough instead of
+                # rewarding the policy to track it, so this is disabled (0.0).
+                head_command=0.0,
             ),
             tracking_sigma=0.01,  # was working at 0.01
             # Imitation (reference-motion) internal joint-tracking weights.
@@ -240,6 +270,8 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         self._leg_action_indices = jp.array(LEG_ACTION_INDICES)
         self._neck_action_indices = jp.array(NECK_ACTION_INDICES)
         self._head_command_tracking = bool(HEAD_COMMAND_TRACKING)
+        self._head_passthrough = bool(HEAD_PASSTHROUGH)
+        self._head_disturbance_sampling = bool(HEAD_DISTURBANCE_SAMPLING)
 
         self._torso_body_id = self._mj_model.body(constants.ROOT_BODY).id
         self._torso_mass = self._mj_model.body_subtreemass[self._torso_body_id]
@@ -366,6 +398,13 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             "last_last_act": jp.zeros(self.mjx_model.nu),
             "last_last_last_act": jp.zeros(self.mjx_model.nu),
             "motor_targets": self._default_actuator,
+            # Iteration-3 additive head passthrough: the speed-limit clip tracks the
+            # PRE-additive motor target (mirrors runtime v2_rl_walk_mujoco.py line
+            # ordering, where prev_motor_targets is saved before the head command is
+            # added). "motor_targets" itself stores the command-inclusive target so
+            # the observation matches what the runtime observes. When passthrough is
+            # off the two are identical (baseline behaviour preserved).
+            "motor_targets_preadd": self._default_actuator,
             "feet_air_time": jp.zeros(2),
             "last_contact": jp.zeros(2, dtype=bool),
             "swing_peak": jp.zeros(2),
@@ -491,7 +530,11 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         )
 
         if USE_MOTOR_SPEED_LIMITS:
-            prev_motor_targets = state.info["motor_targets"]
+            # Speed-limit clip tracks the PRE-additive target (matches the runtime
+            # and the S0.1/envelope harness, which save prev_motor_targets before
+            # the head command is added -- see v2_rl_walk_mujoco.py and
+            # spike_s01_head_response.control_tick).
+            prev_motor_targets = state.info["motor_targets_preadd"]
 
             motor_targets = jp.clip(
                 motor_targets,
@@ -501,9 +544,28 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
                 + self._config.max_motor_velocity * self.dt,  # control dt
             )
 
-        # motor_targets.at[5:9].set(state.info["command"][3:])  # head joints
+        # Pre-additive target (feeds the next tick's speed-limit clip).
+        motor_targets_preadd = motor_targets
+
+        # ITERATION 3: additive head passthrough. Drive the 4 head joints
+        # (indices 5:9) from the sampled head command cmd[3:7], added on top of the
+        # policy's head output -- EXACTLY mirroring the deployed runtime
+        # (v2_rl_walk_mujoco.py:310-311: motor_targets[5:9] = command[3:7] +
+        # motor_targets[5:9]). The head command is added raw (not rate-limited),
+        # like the runtime, so fast command transitions produce a genuine dynamic
+        # disturbance the legs must reject. The policy's own head action stays in
+        # the 14-wide action vector (obs/action shapes are unchanged) and rides on
+        # top, matching the runtime additive semantics.
+        if self._head_passthrough:
+            motor_targets = motor_targets.at[5:9].set(
+                state.info["command"][3:7] + motor_targets[5:9]
+            )
+
         data = mjx_env.step(self.mjx_model, state.data, motor_targets, self.n_substeps)
 
+        # Pre-additive target for the next clip; command-inclusive target for the
+        # observation (mirrors what the runtime places in its obs).
+        state.info["motor_targets_preadd"] = motor_targets_preadd
         state.info["motor_targets"] = motor_targets
 
         contact = jp.array(
@@ -544,10 +606,10 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             self.sample_command(cmd_rng),
             state.info["command"],
         )
-        # Iteration-2: resample ONLY the head command (cmd[3:7]) on a faster
-        # cadence than the 500-step full-command resample above, for a denser
-        # command->response learning signal. Locomotion is untouched here.
-        if self._head_command_tracking:
+        # Resample ONLY the head command (cmd[3:7]) on a fast cadence for a dense
+        # head disturbance (iteration 3) / learning signal (iteration 2).
+        # Locomotion is untouched here.
+        if self._head_disturbance_sampling:
             state.info["head_command_step"] += 1
             state.info["rng"], head_rng = jax.random.split(state.info["rng"])
             resample_head = (
@@ -824,7 +886,11 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
                 self.get_actuator_joints_qpos(data.qpos),
                 self.get_actuator_joints_qvel(data.qvel),
                 self._default_actuator,
-                ignore_head=False,
+                # Iteration 3: the head is driven externally by the passthrough, so
+                # its deviation from the default pose must NOT be penalised as
+                # "not standing still" -- otherwise this term fights the commanded
+                # head motion. Only the legs are held still while standing.
+                ignore_head=self._head_passthrough,
             ),
         }
 
@@ -872,12 +938,12 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         head = jp.hstack([neck_pitch, head_pitch, head_yaw, head_roll])
         locomotion = jp.hstack([lin_vel_x, lin_vel_y, ang_vel_yaw])
 
-        if HEAD_COMMAND_TRACKING:
-            # Iteration-2: decouple head and locomotion zeroing so "stand still +
-            # move head" is actually sampled. The old zero-everything path zeroed
-            # locomotion AND head together, and locomotion is otherwise ~always
-            # nonzero, so the standing+head-command regime was NEVER trained --
-            # which is why spike S0.1 measured ~0 head gain while standing.
+        if HEAD_DISTURBANCE_SAMPLING:
+            # Decouple head and locomotion zeroing so "stand still + move head" is
+            # actually sampled (needed for both the iteration-2 reward path and the
+            # iteration-3 passthrough disturbance). The old zero-everything path
+            # zeroed locomotion AND head together, and locomotion is otherwise
+            # ~always nonzero, so the standing+head regime was NEVER trained.
             # With p=stand_probability the robot is commanded to stand (locomotion
             # zeroed) while the head stays commanded; independently, with
             # p=head_zero_probability the head command is zeroed.

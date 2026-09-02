@@ -8,4 +8,4 @@ mujoco_saved_obs.pkl
 checkpoints/
 .tmp/
 *.onnx
-*.TXT
+*.TXT.smoke_out/

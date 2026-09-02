@@ -1,16 +1,32 @@
-# TRAINING — Phase 5 head-command tracking (Open Duck Mini v2)
+# TRAINING — Phase 5 head passthrough (Open Duck Mini v2)
 
-This branch (`feature/head-command-tracking`) is **iteration 2** of the Phase 5
-head-command fix. It builds on `feature/leg-neck-reward-split` (iteration 1).
+This branch (`feature/head-passthrough-training`) is **iteration 3** of the Phase 5
+head work. It builds on `feature/head-command-tracking` (iteration 2) and
+`feature/leg-neck-reward-split` (iteration 1).
 
-> **Why iteration 2.** Iteration 1 split the imitation reward into leg/neck
-> buckets and weighted the neck 100×, but retrained the policy still measured DC
-> gain ≈0 on all four head channels (S0.1 FAIL). Root cause: the neck bucket's
-> *target* came from `PolyReferenceMotion.get_reference_motion(dx,dy,dtheta,i)`,
-> which is indexed only by locomotion velocity and gait phase and **never sees the
-> head command**. Weighting a command-independent target 100× just pinned the head
-> to the walking clip's nominal pose — actively *suppressing* command response.
-> Iteration 2 makes the heavily-weighted term track the **command**.
+> **Why iteration 3 — the design premise was wrong.** Iterations 1 and 2 tried to
+> make the *walking policy learn* to follow the head command via reward shaping
+> (leg/neck imitation split; then redirecting the neck target to the command).
+> Both retrained and both measured DC gain ≈0 on all four head channels (S0.1
+> FAIL) even though the reward was implemented correctly and active. Iteration 2's
+> post-mortem probed the trained ONNX directly: the policy's head *actions*
+> respond to a unit head command by only ~0.05 (~80× too weak) — a credit-
+> assignment / signal-to-noise failure, not a weight-tuning problem. The head's
+> marginal reward is buried under locomotion/DR/push variance once PPO normalises
+> advantages.
+>
+> The evidence converges on a different conclusion: **the head was never meant to
+> be learned by the walking policy — the deployed runtime drives it *additively*.**
+> `v2_rl_walk_mujoco.py:310-311` does `motor_targets[5:9] = command[3:7] +
+> motor_targets[5:9]`, `joystick.py:504` has that exact line commented out, and
+> `standing.py`'s head reward only works with locomotion off. The additive path is
+> the **correct architecture**, not a defect.
+>
+> So iteration 3 stops trying to *learn* head tracking. It enables the additive
+> head passthrough **during training** so the legs learn to balance while the head
+> is driven through its full randomised command range. **Goal = sim2real fidelity
+> and a wider safe head envelope**, NOT S0.1 gain (which is trivially ≈1.0 with a
+> passthrough and proves nothing about learning).
 
 This file is the launch runbook for a CUDA box (RTX 3090 / 4090).
 
@@ -18,80 +34,78 @@ This file is the launch runbook for a CUDA box (RTX 3090 / 4090).
 
 ## 0. What changed (so you know what you're training)
 
-**Iteration 2 (this branch) — the head now tracks the command:**
+**Iteration 3 (this branch) — additive head passthrough during training:**
 
-- `custom_rewards.py` — `reward_imitation` gains `neck_tracks_command` (default
-  `True`): the neck bucket's target is the sampled head command `cmd[3:7]`
-  (neck-velocity target = 0), **not** the walking clip. This is active only while
-  walking (the imitation reward is gated by `||cmd[:3]|| > 0.01`).
-- `playground/common/rewards.py` — new `cost_head_command_tracking(qpos, cmd)`:
-  tracks `cmd[3:7]` while **standing** (`||cmd[:3]|| < 0.01`), the regime where the
-  imitation reward is gated off entirely. Mirrors the proven `standing.py`
-  mechanism, restricted to standing so it never double-counts with the walking
-  imitation term. Wired as `reward_config.scales.head_command = -3.0`.
-- `joystick.py` — `sample_command` now **decouples** head zeroing from locomotion
-  zeroing and injects explicit standing episodes (`stand_probability=0.2`,
-  `head_zero_probability=0.1`), so "stand still + move head" is actually trained
-  (it never was — the old 10%-zero-everything path zeroed head and locomotion
-  together, and locomotion is otherwise ~always nonzero). The head command is also
-  resampled every `head_command_resample_steps=100` env steps (~2 s) via
-  `sample_head_command`, for a denser command→response signal than the 500-step
-  full-command resample.
-- Master A/B flag `HEAD_COMMAND_TRACKING` (module constant, default `True`) gates
-  the whole iteration-2 package; set it `False` to reproduce the iteration-1
-  (clip-tracking) behaviour.
+- `joystick.py` `step()` — the 4 head joints (`motor_targets[5:9]`) are now driven
+  additively from the sampled head command: `motor_targets[5:9] = command[3:7] +
+  motor_targets[5:9]`, applied **after** the motor-speed clip, **exactly** mirroring
+  the deployed runtime (`v2_rl_walk_mujoco.py:310-311`). The policy's own head
+  action still rides on top (additive, not override) — same semantics as the
+  runtime. The command is added raw (not rate-limited) so fast command transitions
+  are a genuine dynamic disturbance the legs must reject.
+- **Two motor-target values are tracked** to preserve runtime parity: the speed
+  clip tracks the **pre-additive** target (`info["motor_targets_preadd"]`, like the
+  runtime's `prev_motor_targets` which is saved before the head add), while
+  `info["motor_targets"]` holds the **command-inclusive** target that feeds the
+  observation (what the runtime actually observes). When passthrough is off the two
+  are identical, so the A/B is exact.
+- **Reward reverted to the iteration-1/baseline leg-only imitation.**
+  `USE_LEG_NECK_SPLIT = False` restores leg-only imitation (neck discarded, single
+  `action_rate=-0.5`); `HEAD_COMMAND_TRACKING = False` and
+  `reward_config.scales.head_command = 0.0` disable iteration-2's neck-redirect and
+  standing head cost. Rewarding the head is now pointless (and was actively
+  suppressing head motion), so all head reward shaping is off. Legs are trained
+  exactly as the original deployed policy was.
+- `cost_stand_still(..., ignore_head=self._head_passthrough)` — while standing, the
+  head is driven externally, so its deviation from the default pose must **not** be
+  penalised as "not standing still", or the stand-still term would fight the
+  commanded head motion. Only the legs are held still.
+- **Disturbance-rich head sampling stays on.** `sample_command` decouples head
+  zeroing from locomotion zeroing (`stand_probability=0.2`,
+  `head_zero_probability=0.1`) and the head command is resampled every
+  `head_command_resample_steps=100` env steps (~2 s) across its full range, so the
+  legs experience both static offsets and fast head transitions. Gated by
+  `HEAD_DISTURBANCE_SAMPLING = HEAD_COMMAND_TRACKING or HEAD_PASSTHROUGH`.
+- Master A/B flag `HEAD_PASSTHROUGH` (module constant, default `True`) gates the
+  whole iteration-3 package. Set it `False` (with the other flags already `False`)
+  to reproduce the original head-excluded baseline exactly.
 
-**Inherited from iteration 1 (still present):**
+**Unchanged (deployed contract — non-negotiable):**
 
-- `reward_imitation` tracks **legs and neck in separate buckets** (`use_leg_neck_split`);
-  antennas (reference indices 9,10) excluded (not simulated joints).
-- Configurable weights under `reward_config.imitation_config`; split action-rate /
-  action-acceleration penalties (`action_rate_leg/neck`, `action_accel_leg/neck`).
-- Observation layout, `action_scale`, `ctrl_dt`, domain randomisation and the
-  ONNX export path are **unchanged**. Deployed obs is **101** and action **14**.
+- Observation layout is **101**, action is **14**, `action_scale`, `ctrl_dt`,
+  domain randomisation and the ONNX export path are untouched. Both sizes are
+  asserted in the env smoke and unit tests.
 
-Reward weights (`default_config()` in `joystick.py`):
+Flag state on this branch (top of `joystick.py`):
 
-| Term | Value | Config key |
+| Flag | Value | Meaning |
 |---|---|---|
-| leg joint position | 15.0 | `reward_config.imitation_config.w_joint_pos_leg` |
-| neck joint position | 100.0 | `reward_config.imitation_config.w_joint_pos_neck` |
-| leg joint velocity | 1.0e-3 | `reward_config.imitation_config.w_joint_vel_leg` |
-| neck joint velocity | 1.0 | `reward_config.imitation_config.w_joint_vel_neck` |
-| neck tracks command | True | `reward_config.imitation_config.neck_tracks_command` |
-| head_command (standing) | -3.0 | `reward_config.scales.head_command` |
-| action rate leg / neck | -1.5 / -5.0 | `reward_config.scales.action_rate_leg/neck` |
-| action accel leg / neck | -0.45 / -5.0 | `reward_config.scales.action_accel_leg/neck` |
-| stand probability | 0.2 | `stand_probability` |
-| head resample steps | 100 | `head_command_resample_steps` |
+| `HEAD_PASSTHROUGH` | `True` | additive head passthrough during training (iteration 3) |
+| `HEAD_COMMAND_TRACKING` | `False` | iteration-2 neck-redirect + standing head cost OFF |
+| `USE_LEG_NECK_SPLIT` | `False` | leg-only baseline imitation (neck discarded) |
+| `HEAD_DISTURBANCE_SAMPLING` | `True` | derived: full-range head resampling every ~2 s |
 
-To train the **iteration-1 (failed) behaviour** for an A/B comparison, set
-`HEAD_COMMAND_TRACKING = False` in `joystick.py` (top of file) before launching.
+To train the **original head-excluded baseline** for an A/B comparison, set
+`HEAD_PASSTHROUGH = False` in `joystick.py` before launching (the other two feature
+flags are already `False`).
 
 ---
 
 ## 1. Environment setup on the CUDA box
 
-The repo is `uv`-managed and its `pyproject.toml` already pins `jax[cuda12]`, so
-on a Linux CUDA host the canonical path just works — **use `uv`, do not
-hand-assemble a venv** (the macOS-CPU dance in `tests/` was only needed because
-there are no CUDA/JAX wheels for macOS):
+**Do NOT use plain `uv sync`** — it resolves `playground==0.2.0`, which breaks on
+`mujoco_playground._src.collision`. Pin the proven stack explicitly:
 
 ```bash
-# from the repo root
-curl -LsSf https://astral.sh/uv/install.sh | sh   # if uv is missing
-uv sync                                            # installs jax[cuda12], brax, mjx, tf2onnx...
+# from the repo root, inside the uv container image ghcr.io/astral-sh/uv:python3.11-bookworm
+uv pip install "playground==0.0.3" "jax[cuda12]==0.5.3" "jaxlib==0.5.3" "flax==0.10.4"
 # sanity: confirm JAX sees the GPU
-uv run python -c "import jax; print(jax.devices())"   # -> [CudaDevice(id=0)]
+uv run --no-sync python -c "import jax; print(jax.devices())"   # -> [CudaDevice(id=0)]
 ```
 
-If `uv sync` resolves a JAX newer than the training stack tolerates, pin the
-known-good CUDA line explicitly (this mirrors the CPU pins that worked here —
-`brax` currently needs `jax < 0.11`):
-
-```bash
-uv pip install "jax[cuda12]==0.5.3" "jaxlib==0.5.3" "flax==0.10.4"
-```
+Always launch the runner with `uv run --no-sync` so uv does not re-resolve to the
+broken `0.2.0`. Set `XLA_PYTHON_CLIENT_PREALLOCATE=false` so the run coexists with
+the homelab's other GPU containers.
 
 The imitation reward requires the reference-motion polynomials; they are already
 committed at `playground/open_duck_mini_v2/data/polynomial_coefficients.pkl`
@@ -102,39 +116,31 @@ and `USE_IMITATION_REWARD = True` is already set.
 ## 2. Launch training
 
 Train the **`flat_terrain_backlash`** task — the backlash variants are the
-current sim2real win (see `constants.py:20-36` and the repo README "Current
-win"). 300M steps matches the repo's proven config:
+current sim2real win (see `constants.py:20-36`). 300M steps matches the proven
+config. Use a **new** container name and a **new** output dir so iteration-1/2
+artefacts are not overwritten:
 
 ```bash
-uv run playground/open_duck_mini_v2/runner.py \
+XLA_PYTHON_CLIENT_PREALLOCATE=false \
+uv run --no-sync playground/open_duck_mini_v2/runner.py \
     --env joystick \
     --task flat_terrain_backlash \
     --num_timesteps 300000000 \
-    --output_dir checkpoints_head_cmd
+    --output_dir checkpoints_head_passthrough
 ```
 
 Notes:
-- `--output_dir checkpoints_head_cmd` keeps iteration-2 artefacts separate from
-  the iteration-1 run — do not overwrite the previous checkpoints.
+- `--output_dir checkpoints_head_passthrough` keeps iteration-3 artefacts separate.
 - `--env joystick` is the walking/standing policy that carries the head command
-  channels. (`standing` is a separate dock/perpetual policy and is not this fix.)
-- To resume: add `--restore_checkpoint_path <checkpoints_head_cmd/DATE_STEP>`.
-- Watch it: `uv run tensorboard --logdir=checkpoints_head_cmd` — the key new
-  curves are `reward/imitation` (now command-driven while walking) and
-  `cost/head_command` (standing head-tracking error; should fall toward 0).
+  channels. (`standing` is a separate policy and is not this fix.)
+- Watch it: `uv run --no-sync tensorboard --logdir=checkpoints_head_passthrough`.
+  With the head reward off, the key curve is just `eval/episode_reward` (should
+  climb and stay healthy) — head tracking is now handled by the passthrough, not a
+  reward, so there is no head-reward curve to watch.
 
-### Expected wall-clock (rough — no GPU was available to calibrate)
+### Expected wall-clock (measured on this homelab's RTX 3090)
 
-MJX PPO with `num_envs=8192`, 300M steps on this ~14-DOF biped:
-
-| GPU | Estimate |
-|---|---|
-| RTX 4090 | ~3–6 h |
-| RTX 3090 | ~5–9 h |
-
-These are order-of-magnitude only; the first run establishes the real number.
-Reduce `--num_timesteps` (e.g. 150M) for a faster first pass if you just want a
-policy to re-measure S0.1 against.
+~68k steps/sec, **300M steps in ~1.2 h**. Checkpoints + ONNX export every ~5 min.
 
 ---
 
@@ -178,19 +184,41 @@ uv run playground/open_duck_mini_v2/mujoco_infer.py -o checkpoints/<DATE>_<STEP>
 
 ---
 
-## 4. Acceptance gate (from the plan, Phase 5)
+## 4. Acceptance gate (iteration 3 — envelope, NOT S0.1 gain)
 
-Re-run spike **S0.1** against the retrained ONNX on the same harness
-(`experiments/animation/spike_s01_head_response.py` in the design repo) and
-require, standing and walking:
+Iteration 3's acceptance criteria **replace** the S0.1 gain gate. With a
+passthrough, `policy_only` S0.1 gain is ≈0 (the policy alone barely moves the
+head) and `additive` gain is ≈1.0 by construction — neither proves learning. The
+real objective is a **wider safe head operating envelope**.
 
-- per-channel DC gain **≥ 0.6** (was ≈0 on the current checkpoint),
-- cross-coupling **≤ 0.2**,
-- in-sim RMS head-tracking error reduced **≥ 2×** vs the current checkpoint.
+1. **Locomotion not regressed.** Stands and walks, no falls. Compare walk tilt to
+   baseline ~3°, iter-1 ~9°, iter-2 ~4.1°. A large tilt regression is a fail.
+2. **The safe head envelope widens (primary metric).** Re-run
+   `experiments/animation/envelope_sweep.py` (main repo, branch
+   `clancey-blender-animation-sim2real`) in `--mode additive` (matches how the
+   head is now driven) on the new checkpoint, stand and walk. Compare the
+   per-channel deflection limits and combined L2 budget to the current committed
+   constants in `open_duck_anim/envelope.py`:
+   `neck_pitch [-0.16,+0.31]`, `head_pitch [-0.78,+0.78]`,
+   `head_yaw [-0.29,+1.50]`, `head_roll [-0.50,+0.50]`, `COMBINED_L2_BUDGET=0.55`.
+   The harness derives limits by a fine first-onset outward sweep with ≥5 s holds
+   (instability is non-monotonic and time-dependent) — do not substitute bisection
+   or a coarse grid.
+3. **Head tracking gain in the driven (additive) mode ≈1.0** — sanity only, that
+   the passthrough is wired correctly. Not a learning claim.
+4. **No fall at full commanded deflection.** Re-test the cases that toppled the old
+   policy: step inputs at the extremes of `neck_pitch` and `head_yaw`, stand and
+   walk. Surviving those is the headline result.
 
-Only once that passes do you delete the additive head lines
-(`Open_Duck_Mini_Runtime/scripts/v2_rl_walk_mujoco.py:310-311`) and switch head
-injection to the command channel — **in the same change** as shipping this ONNX.
+If the envelope does **not** widen materially: **STOP — do not attempt iteration
+4.** The conclusion is that the additive path plus the currently-measured
+conservative envelope is what ships (an acceptable outcome; the animation feature
+already works via that path). Report and stop.
+
+If it **passes**: update the constants in `open_duck_anim/envelope.py` to the new
+measured limits. The additive lines at `v2_rl_walk_mujoco.py:310-311` stay (they
+are now the intended architecture, matched in training) — they do **not** become a
+double-count, because iteration 3 does not add a competing command channel.
 
 ---
 
@@ -201,8 +229,11 @@ injection to the command channel — **in the same change** as shipping this ONN
 python -m venv ~/.oduck_train_venv   # or: uv venv ~/.oduck_train_venv
 source ~/.oduck_train_venv/bin/activate
 
-JAX_PLATFORMS=cpu python tests/test_leg_neck_reward_split.py   # 9 checks; proves slicing + command drives the neck target
-JAX_PLATFORMS=cpu python tests/smoke_env_step.py              # env constructs, obs=101, head_command bucket present, no NaN
-JAX_PLATFORMS=cpu python tests/smoke_train.py                 # PPO runs a few tiny iters, no NaN
-JAX_PLATFORMS=cpu python tests/smoke_onnx_export.py           # export -> obs[1,101]/action[1,14]
+# 10 checks: leg/neck slicing + command-drives-target + iteration-3 end-to-end
+# passthrough (zero policy action -> head driven to command; obs=101/action=14):
+JAX_PLATFORMS=cpu python tests/test_leg_neck_reward_split.py
+
+# tiny PPO smoke: env constructs, passthrough active, PPO loop runs, no NaN,
+# ONNX export -> obs[1,101] / continuous_actions[1,14]:
+JAX_PLATFORMS=cpu python smoke_iter3.py
 ```

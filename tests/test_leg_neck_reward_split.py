@@ -318,6 +318,60 @@ def test_head_command_cost_standing_regime():
     print(f"[PASS] head_command cost: standing {c0:.3f}->{c50:.3f} toward cmd; walking=0")
 
 
+def test_iter3_head_passthrough_drives_head_and_shapes():
+    """ITERATION 3 (additive head passthrough) end-to-end check on the REAL env.
+
+    With HEAD_PASSTHROUGH active and a ZERO policy action, the head joints must be
+    driven to the sampled head command (mirroring the deployed runtime's additive
+    line motor_targets[5:9] = command[3:7] + motor_targets[5:9]). Also asserts the
+    deployed tensor contract is untouched: obs == (101,), action == 14.
+
+    This is the single most important iteration-3 assertion: it proves the
+    command actually drives the head target through the env step, which the two
+    reward-based iterations failed to achieve.
+    """
+    import jax
+    from playground.open_duck_mini_v2 import joystick
+
+    assert joystick.HEAD_PASSTHROUGH, "iteration-3 branch must have HEAD_PASSTHROUGH on"
+
+    env = joystick.Joystick(task="flat_terrain")
+    st = env.reset(jax.random.PRNGKey(0))
+
+    assert st.obs["state"].shape == (101,), (
+        f"OBS SIZE CHANGED: {st.obs['state'].shape} (deployed contract is 101)"
+    )
+    assert env.mjx_model.nu == 14, (
+        f"ACTION SIZE CHANGED: {env.mjx_model.nu} (deployed contract is 14)"
+    )
+    assert "motor_targets_preadd" in st.info, "pre-additive target key missing"
+
+    # Command: standing (zero locomotion) + head_yaw = 1.0 rad. head_yaw is index
+    # 2 of the head slice (command[3:7] -> qpos[5:9]).
+    cmd = st.info["command"]
+    cmd = cmd.at[0:3].set(0.0).at[3:7].set(jp.array([0.0, 0.0, 1.0, 0.0]))
+    st.info["command"] = cmd
+
+    zero_act = jp.zeros(14)
+    for _ in range(40):
+        st = env.step(st, zero_act)
+
+    head_qpos = np.array(env.get_actuator_joints_qpos(st.data.qpos))[5:9]
+    assert np.isfinite(np.array(st.obs["state"])).all(), "NaN/Inf in observation"
+    assert abs(head_qpos[2] - 1.0) < 0.1, (
+        f"passthrough must drive head_yaw to command 1.0, got {head_qpos[2]:.3f}"
+    )
+    # Other head channels commanded to 0 should stay near 0.
+    for j in (0, 1, 3):
+        assert abs(head_qpos[j]) < 0.15, (
+            f"uncommanded head channel {j} drifted: {head_qpos[j]:.3f}"
+        )
+    print(
+        f"[PASS] iter3 passthrough: zero-action head qpos={np.round(head_qpos,3)} "
+        f"-> head_yaw~1.0; obs=101, action=14"
+    )
+
+
 def main():
     tests = [
         test_head_yaw_error_moves_only_neck_bucket,
@@ -329,6 +383,7 @@ def main():
         test_command_drives_neck_target,
         test_neck_redirect_ignores_clip,
         test_head_command_cost_standing_regime,
+        test_iter3_head_passthrough_drives_head_and_shapes,
     ]
     for t in tests:
         t()
