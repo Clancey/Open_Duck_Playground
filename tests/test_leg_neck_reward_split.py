@@ -23,6 +23,7 @@ from playground.common.rewards import (
     cost_action_rate,
     cost_action_rate_indexed,
     cost_action_acceleration_indexed,
+    cost_head_command_tracking,
 )
 
 # Canonical index maps (mirrors open_duck_anim/joint_order.py).
@@ -72,7 +73,8 @@ def build_baseline():
     return frame, base_qpos, base_qvel, joints_qpos, joints_qvel, contacts, cmd
 
 
-def call(frame, base_qpos, base_qvel, qpos, qvel, contacts, cmd, split):
+def call(frame, base_qpos, base_qvel, qpos, qvel, contacts, cmd, split,
+         neck_tracks_command=False):
     return float(
         reward_imitation(
             jp.array(base_qpos),
@@ -88,6 +90,7 @@ def call(frame, base_qpos, base_qvel, qpos, qvel, contacts, cmd, split):
             W_POS_NECK,
             W_VEL_LEG,
             W_VEL_NECK,
+            neck_tracks_command,
         )
     )
 
@@ -220,6 +223,101 @@ def test_action_rate_split_indices():
           f"action-accel head_yaw -> neck bucket ({accel_neck:.5f})")
 
 
+def test_command_drives_neck_target():
+    """ITERATION-2 CRITICAL CHECK (the one missing last round).
+
+    With neck_tracks_command=True, a NONZERO head command and the head joint at
+    nominal (0) must produce a NONZERO neck penalty, and the reward must strictly
+    INCREASE as the joint moves toward the commanded value. This proves the command
+    -- not the phase-driven walking clip -- now drives the heavily-weighted neck
+    term, which is the whole point of the fix.
+    """
+    frame, bq, bv, qpos, qvel, contacts, cmd = build_baseline()
+    cmd = cmd.copy()
+    cmd[0] = 0.1          # locomotion nonzero -> imitation gate open (walking)
+    cmd[3:7] = 0.0
+    TARGET = 0.5
+    cmd[5] = TARGET       # cmd[5] == head_yaw command
+
+    def with_head_yaw(val):
+        q = qpos.copy()
+        q[5:9] = 0.0              # head at nominal...
+        q[HEAD_YAW_14] = val      # ...except head_yaw
+        return call(frame, bq, bv, q, qvel, contacts, cmd, split=True,
+                    neck_tracks_command=True)
+
+    r_at0 = with_head_yaw(0.0)     # nominal, far from command
+    r_25 = with_head_yaw(0.25)     # halfway
+    r_50 = with_head_yaw(TARGET)   # exactly on command -> zero neck-pos error
+
+    assert r_50 - r_at0 > 1e-6, (
+        "neck term does NOT respond to the head command -- the redirect is broken "
+        "(this is the iteration-1 failure mode)."
+    )
+    assert r_at0 < r_25 < r_50, (
+        f"reward must increase as head_yaw approaches the command: "
+        f"{r_at0:.4f} < {r_25:.4f} < {r_50:.4f}"
+    )
+    expected = W_POS_NECK * TARGET**2   # neck-pos error at nominal = target^2
+    assert approx(r_50 - r_at0, expected), (
+        f"gain moving joint onto the command {r_50 - r_at0:.4f} != "
+        f"w_neck*target^2 {expected:.4f}"
+    )
+    print(f"[PASS] command drives neck target: r(0)={r_at0:.3f} < r(.25)={r_25:.3f} "
+          f"< r(cmd)={r_50:.3f}; gain={r_50 - r_at0:.3f} == w_neck*t^2={expected:.3f}")
+
+
+def test_neck_redirect_ignores_clip():
+    """With neck_tracks_command=True the neck target is the command, so perturbing
+    the walking CLIP's neck reference must NOT change the reward. In clip mode the
+    same perturbation DOES change it."""
+    frame, bq, bv, qpos, qvel, contacts, cmd = build_baseline()
+    cmd = cmd.copy(); cmd[0] = 0.1
+    base = call(frame, bq, bv, qpos, qvel, contacts, cmd, split=True,
+                neck_tracks_command=True)
+    frame2 = frame.copy()
+    frame2[5:9] += 0.4                      # perturb clip neck ref positions
+    frame2[[16 + i for i in range(5, 9)]] += 0.4  # and clip neck ref velocities
+    perturbed = call(frame2, bq, bv, qpos, qvel, contacts, cmd, split=True,
+                     neck_tracks_command=True)
+    assert approx(base, perturbed), (
+        "clip neck reference leaked into the reward despite neck_tracks_command=True"
+    )
+    base_c = call(frame, bq, bv, qpos, qvel, contacts, cmd, split=True,
+                  neck_tracks_command=False)
+    pert_c = call(frame2, bq, bv, qpos, qvel, contacts, cmd, split=True,
+                  neck_tracks_command=False)
+    assert not approx(base_c, pert_c), "clip mode should still track the clip"
+    print("[PASS] neck redirect ignores the walking clip and tracks the command")
+
+
+def test_head_command_cost_standing_regime():
+    """The dedicated cost_head_command_tracking term covers STANDING: nonzero and
+    decreasing toward the command when ||cmd[:3]||<0.01, exactly zero while walking
+    (where the imitation neck bucket does the tracking instead)."""
+    rng = np.random.default_rng(2)
+    qpos = jp.array(rng.uniform(-0.3, 0.3, size=14))
+    stand_cmd = np.zeros(7); stand_cmd[5] = 0.5    # head_yaw cmd, zero locomotion
+    walk_cmd = stand_cmd.copy(); walk_cmd[0] = 0.1
+
+    def head_at(val, cmd):
+        q = qpos.at[5:9].set(0.0).at[HEAD_YAW_14].set(val)
+        return float(cost_head_command_tracking(q, jp.array(cmd)))
+
+    c0 = head_at(0.0, stand_cmd)
+    c25 = head_at(0.25, stand_cmd)
+    c50 = head_at(0.50, stand_cmd)
+    assert c0 > c25 > c50, (
+        f"standing head cost must fall toward the command: {c0:.4f},{c25:.4f},{c50:.4f}"
+    )
+    assert approx(c50, 0.0), "head exactly on command should have ~zero cost"
+    assert approx(c0, 0.5**2), f"standing cost at nominal should be target^2, got {c0}"
+    assert approx(head_at(0.0, walk_cmd), 0.0), (
+        "head_command term must be gated to 0 while walking"
+    )
+    print(f"[PASS] head_command cost: standing {c0:.3f}->{c50:.3f} toward cmd; walking=0")
+
+
 def main():
     tests = [
         test_head_yaw_error_moves_only_neck_bucket,
@@ -228,10 +326,13 @@ def main():
         test_neck_velocity_bucket,
         test_antennas_never_tracked,
         test_action_rate_split_indices,
+        test_command_drives_neck_target,
+        test_neck_redirect_ignores_clip,
+        test_head_command_cost_standing_regime,
     ]
     for t in tests:
         t()
-    print(f"\nAll {len(tests)} leg/neck reward-split checks PASSED.")
+    print(f"\nAll {len(tests)} leg/neck + head-command reward checks PASSED.")
 
 
 if __name__ == "__main__":

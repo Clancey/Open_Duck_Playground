@@ -39,6 +39,7 @@ from playground.common.rewards import (
     cost_action_rate_indexed,
     cost_action_acceleration_indexed,
     cost_stand_still,
+    cost_head_command_tracking,
     reward_alive,
 )
 from playground.open_duck_mini_v2.custom_rewards import reward_imitation
@@ -55,6 +56,21 @@ USE_MOTOR_SPEED_LIMITS = True
 #          combined action_rate). Use for A/B comparison against the deployed
 #          policy's training reward. See docs/animation_system_plan.md Appendix C.
 USE_LEG_NECK_SPLIT = True
+
+# ITERATION 2 head-command fix (default ON for this branch). Enables the whole
+# head-command-following package so it can be A/B compared against the iteration-1
+# behaviour (which tracked the walking clip and measured DC gain ~=0 in spike
+# S0.1). When True:
+#   * the imitation neck bucket tracks the head command cmd[3:7] instead of the
+#     clip (walking regime) -- see custom_rewards.reward_imitation;
+#   * a dedicated `head_command` cost tracks cmd[3:7] while standing (the regime
+#     where the imitation reward is gated off);
+#   * sample_command decouples head zeroing from locomotion zeroing and injects
+#     explicit standing episodes, so "stand still + move head" is actually trained
+#     (it never was before), and the head command is resampled more frequently.
+# When False: iteration-1 behaviour (clip-tracking neck, no head_command term,
+# original 10%-zero-everything sampling).
+HEAD_COMMAND_TRACKING = True
 
 # Indices into the 14-DOF action / actuator vector (HW bus order, no antennas;
 # see open_duck_anim/joint_order.py HW_ORDER_14):
@@ -109,6 +125,11 @@ def default_config() -> config_dict.ConfigDict:
                 stand_still=-0.2,  # was -1.0 TODO try to relax this a bit ?
                 alive=20.0,
                 imitation=1.0,
+                # Standing-regime head-command tracking (iteration-2). Active only
+                # when ||cmd[:3]|| < 0.01; during walking the imitation neck bucket
+                # (retargeted to the command) does the tracking instead. Set to 0
+                # to disable.
+                head_command=-3.0,
             ),
             tracking_sigma=0.01,  # was working at 0.01
             # Imitation (reference-motion) internal joint-tracking weights.
@@ -120,6 +141,9 @@ def default_config() -> config_dict.ConfigDict:
                 w_joint_pos_neck=100.0,
                 w_joint_vel_leg=1.0e-3,
                 w_joint_vel_neck=1.0,
+                # Iteration-2: retarget the neck bucket to the head command
+                # (cmd[3:7]) rather than the walking clip. See HEAD_COMMAND_TRACKING.
+                neck_tracks_command=HEAD_COMMAND_TRACKING,
             ),
         ),
         push_config=config_dict.create(
@@ -135,6 +159,19 @@ def default_config() -> config_dict.ConfigDict:
         head_yaw_range=[-1.5, 1.5],
         head_roll_range=[-0.5, 0.5],
         head_range_factor=1.0,  # to make it easier
+        # Iteration-2 head-command sampling (active when HEAD_COMMAND_TRACKING).
+        # stand_probability: fraction of resamples that zero the LOCOMOTION command
+        #   only (robot stands) while keeping the head commanded -- this is what
+        #   creates "stand still + move head" training data, which the old
+        #   zero-everything path never produced.
+        # head_zero_probability: fraction of resamples that zero the HEAD command
+        #   only (so a zero head pose is still exercised).
+        # head_command_resample_steps: resample just the head command this often
+        #   (env steps) for a denser command->response signal than the 500-step
+        #   full-command resample. 100 steps = 2 s at ctrl_dt=0.02.
+        stand_probability=0.2,
+        head_zero_probability=0.1,
+        head_command_resample_steps=100,
     )
 
 
@@ -202,6 +239,7 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         )
         self._leg_action_indices = jp.array(LEG_ACTION_INDICES)
         self._neck_action_indices = jp.array(NECK_ACTION_INDICES)
+        self._head_command_tracking = bool(HEAD_COMMAND_TRACKING)
 
         self._torso_body_id = self._mj_model.body(constants.ROOT_BODY).id
         self._torso_mass = self._mj_model.body_subtreemass[self._torso_body_id]
@@ -344,6 +382,8 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             "imitation_i": 0,
             "current_reference_motion": current_reference_motion,
             "imitation_phase": jp.zeros(2),
+            # Iteration-2: counter for the more-frequent head-command resample.
+            "head_command_step": 0,
         }
 
         metrics = {}
@@ -504,6 +544,24 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             self.sample_command(cmd_rng),
             state.info["command"],
         )
+        # Iteration-2: resample ONLY the head command (cmd[3:7]) on a faster
+        # cadence than the 500-step full-command resample above, for a denser
+        # command->response learning signal. Locomotion is untouched here.
+        if self._head_command_tracking:
+            state.info["head_command_step"] += 1
+            state.info["rng"], head_rng = jax.random.split(state.info["rng"])
+            resample_head = (
+                state.info["head_command_step"]
+                > self._config.head_command_resample_steps
+            )
+            new_head = self.sample_head_command(head_rng)
+            new_command = state.info["command"].at[3:7].set(new_head)
+            state.info["command"] = jp.where(
+                resample_head, new_command, state.info["command"]
+            )
+            state.info["head_command_step"] = jp.where(
+                done | resample_head, 0, state.info["head_command_step"]
+            )
         state.info["step"] = jp.where(
             done | (state.info["step"] > 500),
             0,
@@ -747,6 +805,18 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
                 ic.w_joint_pos_neck,
                 ic.w_joint_vel_leg,
                 ic.w_joint_vel_neck,
+                ic.neck_tracks_command,
+            ),
+            # Iteration-2: standing-regime head-command tracking. cost_head_command_tracking
+            # is internally gated to ||cmd[:3]|| < 0.01, so during walking this is
+            # zero and the imitation neck bucket does the tracking instead.
+            "head_command": (
+                cost_head_command_tracking(
+                    self.get_actuator_joints_qpos(data.qpos),
+                    info["command"],
+                )
+                if self._head_command_tracking
+                else zero
             ),
             "stand_still": cost_stand_still(
                 # info["command"], data.qpos[7:], data.qvel[6:], self._default_pose
@@ -799,19 +869,66 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             maxval=self._config.head_roll_range[1] * self._config.head_range_factor,
         )
 
-        # With 10% chance, set everything to zero.
+        head = jp.hstack([neck_pitch, head_pitch, head_yaw, head_roll])
+        locomotion = jp.hstack([lin_vel_x, lin_vel_y, ang_vel_yaw])
+
+        if HEAD_COMMAND_TRACKING:
+            # Iteration-2: decouple head and locomotion zeroing so "stand still +
+            # move head" is actually sampled. The old zero-everything path zeroed
+            # locomotion AND head together, and locomotion is otherwise ~always
+            # nonzero, so the standing+head-command regime was NEVER trained --
+            # which is why spike S0.1 measured ~0 head gain while standing.
+            # With p=stand_probability the robot is commanded to stand (locomotion
+            # zeroed) while the head stays commanded; independently, with
+            # p=head_zero_probability the head command is zeroed.
+            rng_stand, rng_head_zero = jax.random.split(rng4)
+            zero_locomotion = jax.random.bernoulli(
+                rng_stand, p=self._config.stand_probability
+            )
+            zero_head = jax.random.bernoulli(
+                rng_head_zero, p=self._config.head_zero_probability
+            )
+            locomotion = jp.where(zero_locomotion, jp.zeros(3), locomotion)
+            head = jp.where(zero_head, jp.zeros(4), head)
+            return jp.concatenate([locomotion, head])
+
+        # Original behaviour: with 10% chance, set everything to zero.
         return jp.where(
             jax.random.bernoulli(rng4, p=0.1),
             jp.zeros(7),
-            jp.hstack(
-                [
-                    lin_vel_x,
-                    lin_vel_y,
-                    ang_vel_yaw,
-                    neck_pitch,
-                    head_pitch,
-                    head_yaw,
-                    head_roll,
-                ]
-            ),
+            jp.concatenate([locomotion, head]),
+        )
+
+    def sample_head_command(self, rng: jax.Array) -> jax.Array:
+        """Sample only the 4 head command channels (cmd[3:7]) for the fast head
+        resample (iteration-2). Independent per-channel uniforms over the
+        configured head ranges, with a head_zero_probability chance of a zero
+        head pose. Locomotion is left untouched by the caller."""
+        rng5, rng6, rng7, rng8, rng_zero = jax.random.split(rng, 5)
+        f = self._config.head_range_factor
+        neck_pitch = jax.random.uniform(
+            rng5,
+            minval=self._config.neck_pitch_range[0] * f,
+            maxval=self._config.neck_pitch_range[1] * f,
+        )
+        head_pitch = jax.random.uniform(
+            rng6,
+            minval=self._config.head_pitch_range[0] * f,
+            maxval=self._config.head_pitch_range[1] * f,
+        )
+        head_yaw = jax.random.uniform(
+            rng7,
+            minval=self._config.head_yaw_range[0] * f,
+            maxval=self._config.head_yaw_range[1] * f,
+        )
+        head_roll = jax.random.uniform(
+            rng8,
+            minval=self._config.head_roll_range[0] * f,
+            maxval=self._config.head_roll_range[1] * f,
+        )
+        head = jp.hstack([neck_pitch, head_pitch, head_yaw, head_roll])
+        return jp.where(
+            jax.random.bernoulli(rng_zero, p=self._config.head_zero_probability),
+            jp.zeros(4),
+            head,
         )

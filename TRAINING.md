@@ -1,33 +1,56 @@
-# TRAINING — Phase 5 leg/neck reward split (Open Duck Mini v2)
+# TRAINING — Phase 5 head-command tracking (Open Duck Mini v2)
 
-This branch (`feature/leg-neck-reward-split`) restores Disney BD-X's leg/neck
-imitation-reward split so the policy actually tracks the four head command
-channels (`commands[3:7]`). It is ready to train the moment GPU access lands.
+This branch (`feature/head-command-tracking`) is **iteration 2** of the Phase 5
+head-command fix. It builds on `feature/leg-neck-reward-split` (iteration 1).
+
+> **Why iteration 2.** Iteration 1 split the imitation reward into leg/neck
+> buckets and weighted the neck 100×, but retrained the policy still measured DC
+> gain ≈0 on all four head channels (S0.1 FAIL). Root cause: the neck bucket's
+> *target* came from `PolyReferenceMotion.get_reference_motion(dx,dy,dtheta,i)`,
+> which is indexed only by locomotion velocity and gait phase and **never sees the
+> head command**. Weighting a command-independent target 100× just pinned the head
+> to the walking clip's nominal pose — actively *suppressing* command response.
+> Iteration 2 makes the heavily-weighted term track the **command**.
+
 This file is the launch runbook for a CUDA box (RTX 3090 / 4090).
-
-> Context: spike S0.1 measured the deployed policy's head-command DC gain at
-> ≈0 because the old imitation reward discarded the neck/head joints. See
-> `docs/animation_system_plan.md` §7 Phase 5 and Appendix C in the design repo.
 
 ---
 
 ## 0. What changed (so you know what you're training)
 
-- `playground/open_duck_mini_v2/custom_rewards.py` — `reward_imitation` now
-  tracks **legs and neck in separate buckets** instead of discarding the neck.
-  Antennas (reference indices 9,10) are still excluded (they are not simulated
-  joints). Controlled by `use_leg_neck_split`.
-- `playground/open_duck_mini_v2/joystick.py` — new configurable weights under
-  `reward_config.imitation_config` and split action-rate / action-acceleration
-  penalties (`action_rate_leg/neck`, `action_accel_leg/neck`). A/B toggle
-  `USE_LEG_NECK_SPLIT` (module constant → `imitation_config.use_leg_neck_split`),
-  **defaulted to the NEW behaviour on this branch**.
-- `playground/common/rewards.py` — `cost_action_rate_indexed`,
-  `cost_action_acceleration_indexed` helpers for the leg/neck smoothness split.
+**Iteration 2 (this branch) — the head now tracks the command:**
+
+- `custom_rewards.py` — `reward_imitation` gains `neck_tracks_command` (default
+  `True`): the neck bucket's target is the sampled head command `cmd[3:7]`
+  (neck-velocity target = 0), **not** the walking clip. This is active only while
+  walking (the imitation reward is gated by `||cmd[:3]|| > 0.01`).
+- `playground/common/rewards.py` — new `cost_head_command_tracking(qpos, cmd)`:
+  tracks `cmd[3:7]` while **standing** (`||cmd[:3]|| < 0.01`), the regime where the
+  imitation reward is gated off entirely. Mirrors the proven `standing.py`
+  mechanism, restricted to standing so it never double-counts with the walking
+  imitation term. Wired as `reward_config.scales.head_command = -3.0`.
+- `joystick.py` — `sample_command` now **decouples** head zeroing from locomotion
+  zeroing and injects explicit standing episodes (`stand_probability=0.2`,
+  `head_zero_probability=0.1`), so "stand still + move head" is actually trained
+  (it never was — the old 10%-zero-everything path zeroed head and locomotion
+  together, and locomotion is otherwise ~always nonzero). The head command is also
+  resampled every `head_command_resample_steps=100` env steps (~2 s) via
+  `sample_head_command`, for a denser command→response signal than the 500-step
+  full-command resample.
+- Master A/B flag `HEAD_COMMAND_TRACKING` (module constant, default `True`) gates
+  the whole iteration-2 package; set it `False` to reproduce the iteration-1
+  (clip-tracking) behaviour.
+
+**Inherited from iteration 1 (still present):**
+
+- `reward_imitation` tracks **legs and neck in separate buckets** (`use_leg_neck_split`);
+  antennas (reference indices 9,10) excluded (not simulated joints).
+- Configurable weights under `reward_config.imitation_config`; split action-rate /
+  action-acceleration penalties (`action_rate_leg/neck`, `action_accel_leg/neck`).
 - Observation layout, `action_scale`, `ctrl_dt`, domain randomisation and the
   ONNX export path are **unchanged**. Deployed obs is **101** and action **14**.
 
-Reward weights (Disney BD-X Table I; `default_config()` in `joystick.py`):
+Reward weights (`default_config()` in `joystick.py`):
 
 | Term | Value | Config key |
 |---|---|---|
@@ -35,11 +58,15 @@ Reward weights (Disney BD-X Table I; `default_config()` in `joystick.py`):
 | neck joint position | 100.0 | `reward_config.imitation_config.w_joint_pos_neck` |
 | leg joint velocity | 1.0e-3 | `reward_config.imitation_config.w_joint_vel_leg` |
 | neck joint velocity | 1.0 | `reward_config.imitation_config.w_joint_vel_neck` |
+| neck tracks command | True | `reward_config.imitation_config.neck_tracks_command` |
+| head_command (standing) | -3.0 | `reward_config.scales.head_command` |
 | action rate leg / neck | -1.5 / -5.0 | `reward_config.scales.action_rate_leg/neck` |
 | action accel leg / neck | -0.45 / -5.0 | `reward_config.scales.action_accel_leg/neck` |
+| stand probability | 0.2 | `stand_probability` |
+| head resample steps | 100 | `head_command_resample_steps` |
 
-To train the **old (head-excluded) baseline** for an A/B comparison, set
-`USE_LEG_NECK_SPLIT = False` in `joystick.py` (top of file) before launching.
+To train the **iteration-1 (failed) behaviour** for an A/B comparison, set
+`HEAD_COMMAND_TRACKING = False` in `joystick.py` (top of file) before launching.
 
 ---
 
@@ -83,15 +110,18 @@ uv run playground/open_duck_mini_v2/runner.py \
     --env joystick \
     --task flat_terrain_backlash \
     --num_timesteps 300000000 \
-    --output_dir checkpoints
+    --output_dir checkpoints_head_cmd
 ```
 
 Notes:
+- `--output_dir checkpoints_head_cmd` keeps iteration-2 artefacts separate from
+  the iteration-1 run — do not overwrite the previous checkpoints.
 - `--env joystick` is the walking/standing policy that carries the head command
   channels. (`standing` is a separate dock/perpetual policy and is not this fix.)
-- To resume: add `--restore_checkpoint_path <checkpoints/DATE_STEP>`.
-- Watch it: `uv run tensorboard --logdir=checkpoints` — the key new curves are
-  `reward/imitation`, `cost/action_rate_neck`, `cost/action_accel_neck`.
+- To resume: add `--restore_checkpoint_path <checkpoints_head_cmd/DATE_STEP>`.
+- Watch it: `uv run tensorboard --logdir=checkpoints_head_cmd` — the key new
+  curves are `reward/imitation` (now command-driven while walking) and
+  `cost/head_command` (standing head-tracking error; should fall toward 0).
 
 ### Expected wall-clock (rough — no GPU was available to calibrate)
 
@@ -171,8 +201,8 @@ injection to the command channel — **in the same change** as shipping this ONN
 python -m venv ~/.oduck_train_venv   # or: uv venv ~/.oduck_train_venv
 source ~/.oduck_train_venv/bin/activate
 
-JAX_PLATFORMS=cpu python tests/test_leg_neck_reward_split.py   # proves the leg/neck slicing
-JAX_PLATFORMS=cpu python tests/smoke_env_step.py              # env constructs, obs=101, no NaN
+JAX_PLATFORMS=cpu python tests/test_leg_neck_reward_split.py   # 9 checks; proves slicing + command drives the neck target
+JAX_PLATFORMS=cpu python tests/smoke_env_step.py              # env constructs, obs=101, head_command bucket present, no NaN
 JAX_PLATFORMS=cpu python tests/smoke_train.py                 # PPO runs a few tiny iters, no NaN
 JAX_PLATFORMS=cpu python tests/smoke_onnx_export.py           # export -> obs[1,101]/action[1,14]
 ```

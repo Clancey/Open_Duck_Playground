@@ -15,6 +15,7 @@ def reward_imitation(
     w_joint_pos_neck: float = 100.0,
     w_joint_vel_leg: float = 1.0e-3,
     w_joint_vel_neck: float = 1.0,
+    neck_tracks_command: bool = True,
 ) -> jax.Array:
     """Imitation (reference-motion tracking) reward.
 
@@ -29,7 +30,19 @@ def reward_imitation(
     * ``True`` (default on this branch) — Disney BD-X Table I (arXiv:2501.05204)
       leg/neck split: legs and neck are tracked in *separate* buckets so the neck
       can be weighted much more heavily (``w_joint_pos_neck`` ~6.7x the leg
-      weight), which is what teaches head-command-following.
+      weight).
+
+    ITERATION 2 FIX (``neck_tracks_command``, default True): the neck bucket now
+    tracks the sampled **head command** ``cmd[3:7]`` instead of the walking-clip's
+    nominal neck pose. Iteration 1 weighted the neck 100x while its target came
+    from ``get_reference_motion`` — which is indexed only by locomotion velocity
+    and gait phase and NEVER sees the head command. That pinned the head to the
+    clip's nominal pose and actively suppressed command-following (spike S0.1:
+    DC gain ~=0). Retargeting the same heavily-weighted term to the command turns
+    it into the head-command-tracking signal it was always meant to be. This term
+    is only active while walking (the whole imitation reward is gated by
+    ``cmd_norm > 0.01`` at the end); the standing regime is covered by a separate
+    ``cost_head_command_tracking`` term in the env (see joystick.py).
 
     All weights are passed in from the env config (``reward_config.imitation_config``)
     so they can be swept without editing this file.
@@ -122,10 +135,23 @@ def reward_imitation(
 
     # --- Neck/head bucket (neck_pitch, head_pitch, head_yaw, head_roll)
     # indices 5:9 in BOTH the 16-DOF reference and the 14-DOF qpos.
-    ref_neck_pos = ref_joint_pos[5:9]
+    #
+    # ITERATION 2: the neck TARGET is the sampled head command (cmd[3:7]), NOT the
+    # walking clip. cmd is [lin_x, lin_y, ang_yaw, neck_pitch, head_pitch,
+    # head_yaw, head_roll]; cmd[3:7] are exactly the 4 head channels, aligned with
+    # qpos[5:9] (open_duck_anim/joint_order.py: head block is indices 5..8 in both
+    # the 14- and 16-DOF orders). The command is a static setpoint, so the neck
+    # velocity target is zero (tracking the clip's neck velocity would fight the
+    # command). Set neck_tracks_command=False to restore the iteration-1 behaviour
+    # (track the clip) for A/B comparison.
     neck_pos = joints_qpos[5:9]
-    ref_neck_vel = ref_joint_vels[5:9]
     neck_vel = joints_qvel[5:9]
+    if neck_tracks_command:
+        ref_neck_pos = cmd[3:7]
+        ref_neck_vel = jp.zeros(4)
+    else:
+        ref_neck_pos = ref_joint_pos[5:9]
+        ref_neck_vel = ref_joint_vels[5:9]
 
     # ref_left_toe_pos = reference_frame[left_toe_pos_slice_start:left_toe_pos_slice_end]
     # ref_right_toe_pos = reference_frame[right_toe_pos_slice_start:right_toe_pos_slice_end]

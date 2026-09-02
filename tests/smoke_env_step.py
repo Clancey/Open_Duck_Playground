@@ -53,12 +53,18 @@ def main():
             f"non-finite obs at step {i}"
         )
         keys = ("action_rate", "action_rate_leg", "action_rate_neck",
-                "action_accel_leg", "action_accel_neck", "imitation")
+                "action_accel_leg", "action_accel_neck", "imitation",
+                "head_command")
         buckets = {}
         for k in keys:
             for pref in ("reward/", "cost/"):
                 if pref + k in state.metrics:
                     buckets[k] = round(float(state.metrics[pref + k]), 4)
+        assert "head_command" in buckets, (
+            "head_command reward bucket missing -- iteration-2 term not wired"
+        )
+        for k, v in buckets.items():
+            assert np.isfinite(v), f"non-finite bucket {k}={v} at step {i}"
         print(f"step {i}: reward={r:.4f} done={int(state.done)} "
               f"buckets={buckets}")
 

@@ -177,6 +177,36 @@ def cost_head_pos(
     # return jp.nan_to_num(head_pos_error + head_vel_error)
 
 
+def cost_head_command_tracking(
+    joints_qpos: jax.Array,
+    cmd: jax.Array,
+) -> jax.Array:
+    """Standing-regime head-command tracking cost (iteration-2 head fix).
+
+    Penalises the 4 head joints ``qpos[5:9]`` (neck_pitch, head_pitch, head_yaw,
+    head_roll) for deviating from the commanded head pose ``cmd[3:7]``.
+
+    Active ONLY when the locomotion command is ~zero (``||cmd[:3]|| < 0.01``),
+    because:
+
+    * While walking, the heavily-weighted imitation neck bucket already tracks the
+      head command (custom_rewards.reward_imitation with neck_tracks_command=True).
+    * The imitation reward is gated OFF entirely when standing
+      (``reward *= cmd_norm > 0.01``), so without this term the standing head pose
+      is never trained -- which is exactly why spike S0.1 measured ~0 head gain
+      while standing.
+
+    This mirrors the proven ``standing.py`` head-tracking mechanism, restricted to
+    the standing regime so it never double-counts with the walking imitation term.
+    Returns a positive error to be multiplied by a negative scale in the env.
+    """
+    move_cmd_norm = jp.linalg.norm(cmd[:3])
+    head_cmd = cmd[3:7]
+    head_pos = joints_qpos[5:9]
+    head_pos_error = jp.sum(jp.square(head_pos - head_cmd))
+    return jp.nan_to_num(head_pos_error) * (move_cmd_norm < 0.01)
+
+
 # FIXME
 def cost_joint_deviation_hip(
     qpos: jax.Array, cmd: jax.Array, hip_indices: jax.Array, default_pose: jax.Array
