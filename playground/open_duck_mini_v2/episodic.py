@@ -32,6 +32,7 @@ from . import base as open_duck_mini_v2_base
 # from playground.common.utils import LowPassActionFilter
 # from playground.common.poly_reference_motion import PolyReferenceMotion
 from playground.common.episodic_reference_motion import EpisodicReferenceMotion
+from playground.common.phase_encoding import gaussian_phase_jax, DEFAULT_NUM_BASES
 from playground.common.rewards import (
     cost_torques,
     cost_action_rate,
@@ -42,6 +43,10 @@ from playground.open_duck_mini_v2.custom_rewards import reward_imitation
 # if set to false, won't require the reference data to be present and won't compute the reference motions polynoms for nothing
 USE_IMITATION_REWARD = True
 USE_MOTOR_SPEED_LIMITS = True
+
+# Which episodic clip to imitate. A monotonic (one-shot) full-body wiggle that the
+# policy must reproduce while standing and balancing (paper Section V, Eq. 4).
+EPISODIC_CLIP = "playground/open_duck_mini_v2/data/standing_wiggle.json"
 
 
 def default_config() -> config_dict.ConfigDict:
@@ -81,6 +86,19 @@ def default_config() -> config_dict.ConfigDict:
                 imitation=1.0,
             ),
             tracking_sigma=0.01,  # was working at 0.01
+            # Eq. 13 phase-windowed weight boost (Appendix A, paragraph 3). For the
+            # "excited motion" (a full-body torso shake) Disney increases the weight
+            # on angular-velocity tracking during the window where the robot rapidly
+            # shakes its torso; without it the policy "cheats" by barely moving.
+            # w_tilde(phi) = w0 + I[shake_start < phi < shake_end] * w_extra
+            episodic_phase=config_dict.create(
+                num_bases=DEFAULT_NUM_BASES,  # N = 50 Gaussian basis functions
+            ),
+            ang_vel_boost=config_dict.create(
+                shake_start=0.25,  # phi window where the torso shake happens
+                shake_end=0.85,
+                w_extra=2.0,  # added to the nominal 0.5 ang-vel-tracking weight
+            ),
         ),
         push_config=config_dict.create(
             enable=False,
@@ -122,7 +140,15 @@ class Episodic(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         ).ctrl  # ctrl of all the actual joints (no floating base and no backlash)
 
         if USE_IMITATION_REWARD:
-            self.ERM = EpisodicReferenceMotion("playground/open_duck_mini_v2/data/animation_head_modif_new.json")
+            self.ERM = EpisodicReferenceMotion(EPISODIC_CLIP)
+            # One-shot clip: phase advances monotonically 0 -> 1 across the clip.
+            # Phase rate is 1 / clip-duration (paper Section V-A): one frame per
+            # control step (clip FPS == 1/ctrl_dt == 50), so phi hits 1 after exactly
+            # nb_steps steps, at which point the episode is terminated.
+            self._clip_len = int(self.ERM.nb_steps)
+            self._num_bases = int(
+                self._config.reward_config.episodic_phase.num_bases
+            )
 
         # Note: First joint is freejoint.
         # get the range of the joints
@@ -155,6 +181,18 @@ class Episodic(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         self._torso_body_id = self._mj_model.body(constants.ROOT_BODY).id
         self._torso_mass = self._mj_model.body_subtreemass[self._torso_body_id]
         self._site_id = self._mj_model.site("imu").id
+
+        # Bodies used by the episodic fall/self-collision termination (paper
+        # Section V-B: terminate on "either head or torso in contact with the
+        # ground" and on "self-collision between the head and torso"). This model
+        # has no named collision geoms on the head/trunk, so we use body-world-frame
+        # proxies: torso/head height above the floor and head<->trunk separation.
+        self._head_body_id = self._mj_model.body("head_assembly").id
+        # Nominal upright head z ~= 0.344 m, trunk z ~= 0.15 m, head-trunk
+        # separation ~= 0.198 m (measured from the "home" keyframe).
+        self._torso_ground_height = 0.08  # torso center this low => on the ground
+        self._head_ground_height = 0.06  # head this low => head on the ground
+        self._head_torso_min_dist = 0.10  # closer than this => head folded onto torso
 
         self._feet_site_id = np.array(
             [self._mj_model.site(name).id for name in constants.FEET_SITES]
@@ -250,8 +288,12 @@ class Episodic(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         ctrl = self.get_actuator_joints_qpos(qpos)
         # print(f'DEBUG4 ctrl: {ctrl}')
         data = mjx_env.init(self.mjx_model, qpos=qpos, qvel=qvel, ctrl=ctrl)
-        rng, cmd_rng = jax.random.split(rng)
-        cmd = self.sample_command(cmd_rng)
+        # Episodic policy (paper Eq. 4): x_t = f_epis(f_t, phi_t) -- there is NO
+        # command argument. "There is no additional user input until the episodic
+        # motion finishes" (Section VI-B). We keep a zero command in info only so
+        # the shared reward signature is satisfied; it never enters the observation
+        # and never influences the episodic reward.
+        cmd = jp.zeros(7)
 
         # Sample push interval.
         rng, push_rng = jax.random.split(rng)
@@ -290,7 +332,9 @@ class Episodic(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             # imitation related
             "imitation_i": 0,
             "current_reference_motion": current_reference_motion,
-            "imitation_phase": jp.zeros(2),
+            # Monotonic phase projected onto N Gaussian basis functions (paper
+            # Section V / Appendix A). Replaces the old cyclic [cos, sin] pair.
+            "imitation_phase": gaussian_phase_jax(0.0, self._num_bases),
         }
 
         metrics = {}
@@ -315,22 +359,24 @@ class Episodic(open_duck_mini_v2_base.OpenDuckMiniV2Env):
     def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
 
         if USE_IMITATION_REWARD:
+            # FIX #1: phase is MONOTONIC, not cyclic. Advance the frame index by one
+            # per control step (no modulo) so phi = i / (clip_len - 1) increases
+            # monotonically 0 -> 1 across the one-shot clip (paper Section V). The
+            # index is clipped to the last valid frame; the episode is terminated
+            # once phi reaches 1 (handled below in _get_termination).
             state.info["imitation_i"] += 1
-            state.info["imitation_i"] = (
-                state.info["imitation_i"] % self.ERM.nb_steps
-            )  # not critical, is already moduloed in get_reference_motion
-            state.info["imitation_phase"] = jp.array(
-                [
-                    jp.cos((state.info["imitation_i"] / self.ERM.nb_steps) * 2 * jp.pi),
-                    jp.sin((state.info["imitation_i"] / self.ERM.nb_steps) * 2 * jp.pi),
-                ]
-            )
+            idx = jp.clip(state.info["imitation_i"], 0, self._clip_len - 1)
+            phi = idx / (self._clip_len - 1)
+            # FIX #1: encode phi with N Gaussian basis functions (highly local in
+            # time), not a single [cos, sin] pair which cannot represent a one-shot
+            # clip's local structure.
+            state.info["imitation_phase"] = gaussian_phase_jax(phi, self._num_bases)
         else:
             state.info["imitation_i"] = 0
 
         if USE_IMITATION_REWARD:
             state.info["current_reference_motion"] = self.ERM.get_frame(
-                state.info["imitation_i"]
+                jp.clip(state.info["imitation_i"], 0, self._clip_len - 1)
             )
         else:
             state.info["current_reference_motion"] = jp.zeros(0)
@@ -419,7 +465,12 @@ class Episodic(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         state.info["swing_peak"] = jp.maximum(state.info["swing_peak"], p_fz)
 
         obs = self._get_obs(data, state.info, contact)
-        done = self._get_termination(data)
+        # FIX #2: force a transition (episode end) once the one-shot clip finishes
+        # (phi == 1, i.e. imitation_i has reached the last frame) -- paper Section V:
+        # "Once the motion ends, a transition to a new motion is forced." Also
+        # terminate on head/torso ground contact or head-torso self-collision.
+        clip_done = state.info["imitation_i"] >= (self._clip_len - 1)
+        done = self._get_termination(data) | clip_done
 
         rewards = self._get_reward(
             data, action, state.info, state.metrics, done, first_contact, contact
@@ -439,17 +490,12 @@ class Episodic(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         state.info["last_last_act"] = state.info["last_act"]
         state.info["last_act"] = action  # was
         # state.info["last_act"] = motor_targets  # became
-        state.info["rng"], cmd_rng = jax.random.split(state.info["rng"])
-        state.info["command"] = jp.where(
-            state.info["step"] > 500,
-            self.sample_command(cmd_rng),
-            state.info["command"],
-        )
-        state.info["step"] = jp.where(
-            done | (state.info["step"] > 500),
-            0,
-            state.info["step"],
-        )
+        # FIX #3: no command is sampled during an episodic motion (paper Eq. 4 has no
+        # command argument; Section VI-B: "There is no additional user input until
+        # the episodic motion finishes"). The old rollout-length hack that resampled
+        # a command and reset "step" at step > 500 is removed; the episode is now
+        # bounded by the clip itself (clip_done above) or by a fall.
+        state.info["step"] = jp.where(done, 0, state.info["step"])
         state.info["feet_air_time"] *= ~contact
         state.info["last_contact"] = contact
         state.info["swing_peak"] *= ~contact
@@ -467,8 +513,31 @@ class Episodic(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         return state
 
     def _get_termination(self, data: mjx.Data) -> jax.Array:
+        # Paper Section V-B terminates on "either head or torso in contact with the
+        # ground" and on "self-collision between the head and torso". This model has
+        # no named collision geoms on the head/trunk, so we use robust world-frame
+        # geometric proxies instead of geom contact pairs.
+        # (a) tilt: torso up-axis points below horizontal (fallen over).
         fall_termination = self.get_gravity(data)[-1] < 0.0
-        return fall_termination | jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
+        # (b) torso in contact with ground: torso center dropped near the floor.
+        torso_z = data.xpos[self._torso_body_id][2]
+        torso_on_ground = torso_z < self._torso_ground_height
+        # (c) head in contact with ground: head body dropped near the floor.
+        head_pos = data.xpos[self._head_body_id]
+        head_on_ground = head_pos[2] < self._head_ground_height
+        # (d) head-torso self-collision: head folded back onto the torso. Matters for
+        # an aggressive standing wiggle (Section V-B).
+        torso_pos = data.xpos[self._torso_body_id]
+        head_torso_dist = jp.linalg.norm(head_pos - torso_pos)
+        self_collision = head_torso_dist < self._head_torso_min_dist
+        return (
+            fall_termination
+            | torso_on_ground
+            | head_on_ground
+            | self_collision
+            | jp.isnan(data.qpos).any()
+            | jp.isnan(data.qvel).any()
+        )
 
     def _get_obs(
         self, data: mjx.Data, info: dict[str, Any], contact: jax.Array
@@ -560,17 +629,19 @@ class Episodic(open_duck_mini_v2_base.OpenDuckMiniV2Env):
                 # noisy_gravity,  # 3
                 noisy_gyro,  # 3
                 noisy_accelerometer,  # 3
-                info["command"],  # 3
-                noisy_joint_angles - self._default_actuator,  # 10
-                noisy_joint_vel * self._config.dof_vel_scale,  # 10
-                info["last_act"],  # 10
-                info["last_last_act"],  # 10
-                info["last_last_last_act"],  # 10
-                info["motor_targets"],  # 10
+                # FIX #3: NO command in the episodic observation (paper Eq. 4:
+                # x_t = f_epis(f_t, phi_t)). The command is pure noise in the
+                # advantage estimate for a one-shot clip, so it is removed entirely.
+                noisy_joint_angles - self._default_actuator,  # 14
+                noisy_joint_vel * self._config.dof_vel_scale,  # 14
+                info["last_act"],  # 14
+                info["last_last_act"],  # 14
+                info["last_last_last_act"],  # 14
+                info["motor_targets"],  # 14
                 contact,  # 2
-                # info["current_reference_motion"],
-                info["imitation_i"],
-                # info["imitation_phase"],
+                # FIX #1: monotonic phase encoded with N=50 Gaussian bases replaces
+                # the old scalar imitation_i / cyclic [cos, sin] pair.
+                info["imitation_phase"],  # num_bases (50)
             ]
         )
 
@@ -590,13 +661,12 @@ class Episodic(open_duck_mini_v2_base.OpenDuckMiniV2Env):
                 joint_angles - self._default_actuator,
                 joint_vel,
                 root_height,  # 1
-                data.actuator_force,  # 10
+                data.actuator_force,  # 14
                 contact,  # 2
                 feet_vel,  # 4*3
                 info["feet_air_time"],  # 2
                 info["current_reference_motion"],
-                info["imitation_i"],
-                # info["imitation_phase"],
+                info["imitation_phase"],  # num_bases (50)
             ]
         )
 
@@ -617,6 +687,12 @@ class Episodic(open_duck_mini_v2_base.OpenDuckMiniV2Env):
     ) -> dict[str, jax.Array]:
         del metrics  # Unused.
 
+        # Recover the monotonic phase from the frame index for the Eq. 13 window.
+        phi = jp.clip(info["imitation_i"], 0, self._clip_len - 1) / (
+            self._clip_len - 1
+        )
+        boost_cfg = self._config.reward_config.ang_vel_boost
+
         ret = {
             "torques": cost_torques(data.actuator_force),
             "action_rate": cost_action_rate(
@@ -633,7 +709,12 @@ class Episodic(open_duck_mini_v2_base.OpenDuckMiniV2Env):
                 info["command"],
                 USE_IMITATION_REWARD,
                 ignore_head=False,
-                episodic=True
+                episodic=True,
+                # Eq. 13 phase-windowed weight boost on angular-velocity tracking.
+                phase=phi,
+                ang_vel_shake_start=boost_cfg.shake_start,
+                ang_vel_shake_end=boost_cfg.shake_end,
+                ang_vel_extra_weight=boost_cfg.w_extra,
             ),
         }
 

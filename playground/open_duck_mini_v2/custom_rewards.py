@@ -13,6 +13,10 @@ def reward_imitation(
     use_imitation_reward: bool = False,
     ignore_head: bool = True,
     episodic: bool = False,
+    phase: jax.Array = None,
+    ang_vel_shake_start: float = 0.0,
+    ang_vel_shake_end: float = 0.0,
+    ang_vel_extra_weight: float = 0.0,
 ) -> jax.Array:
     if not use_imitation_reward:
         return jp.nan_to_num(0.0)
@@ -30,9 +34,32 @@ def reward_imitation(
         w_joint_pos = 15.0
         w_joint_vel = 1.0e-3
     else:
-        w_joint_pos = 1.0
-        w_joint_vel = 15.0
+        # Standing-wiggle rebalance. The dense per-step advantage must reward
+        # staying UPRIGHT and holding the wiggle POSE (both compatible with
+        # balance), not chasing joint VELOCITIES. With w_joint_vel=15 the only
+        # dense signal was velocity tracking, which a flailing/falling robot can
+        # partially satisfy -> the policy optimized wiggle-velocity while slowly
+        # toppling (episode length shrank, action std ran away to ~10). Position
+        # tracking (w_joint_pos) supplies the VISIBLE wiggle; a strong upright /
+        # base-stillness weight supplies a dense balance gradient every step.
+        w_torso_orientation = 5.0
+        w_lin_vel_xy = 2.0
+        w_lin_vel_z = 2.0
+        w_joint_pos = 4.0
+        w_joint_vel = 2.0
     w_contact = 1.0
+
+    # Eq. 13 phase-windowed weight boost (Appendix A, paragraph 3). For the
+    # "excited motion" (a full-body torso shake) Disney increases the weight on
+    # angular-velocity tracking during the window where the robot rapidly shakes
+    # its torso: w_tilde(phi) = w0 + I[shake_start < phi < shake_end] * w_extra.
+    # Without it the policy "cheats" by barely moving (their jump kept toes on the
+    # ground). Only applied for episodic clips when a phase is supplied.
+    if episodic and phase is not None and ang_vel_extra_weight > 0.0:
+        in_window = (phase > ang_vel_shake_start) & (phase < ang_vel_shake_end)
+        boost = jp.where(in_window, ang_vel_extra_weight, 0.0)
+        w_ang_vel_xy = w_ang_vel_xy + boost
+        w_ang_vel_z = w_ang_vel_z + boost
 
     # Mansin
     # w_torso_pos = 0.0
@@ -150,8 +177,25 @@ def reward_imitation(
         * w_ang_vel_z
     )
 
-    joint_pos_rew = -jp.sum(jp.square(joint_pos - ref_joint_pos)) * w_joint_pos
-    joint_vel_rew = -jp.sum(jp.square(joint_vel - ref_joint_vels)) * w_joint_vel
+    if episodic:
+        # Bounded (DeepMimic-style) tracking rewards in [0, w]. The episodic
+        # branch weights joint-velocity tracking heavily (w=15); as a RAW
+        # negative squared error that is unbounded, so a flailing/falling robot
+        # produces per-step rewards of ~-500 and value targets that blow up
+        # (observed v_loss ~1e8, kl ~1e8), and PPO never finds the "stay upright
+        # and track" basin. Exponential shaping bounds each term and yields a
+        # clean gradient: good tracking -> ~w, falling -> ~0.
+        joint_pos_rew = (
+            jp.exp(-10.0 * jp.sum(jp.square(joint_pos - ref_joint_pos)))
+            * w_joint_pos
+        )
+        joint_vel_rew = (
+            jp.exp(-0.5 * jp.sum(jp.square(joint_vel - ref_joint_vels)))
+            * w_joint_vel
+        )
+    else:
+        joint_pos_rew = -jp.sum(jp.square(joint_pos - ref_joint_pos)) * w_joint_pos
+        joint_vel_rew = -jp.sum(jp.square(joint_vel - ref_joint_vels)) * w_joint_vel
 
     ref_foot_contacts = jp.where(
         ref_foot_contacts > 0.5,

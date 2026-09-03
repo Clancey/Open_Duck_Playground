@@ -88,8 +88,14 @@ def export_onnx(
         )
         return policy_network
 
-    mean = params[0].mean["state"]
-    std = params[0].std["state"]
+    # params[0] is the observation normalizer (RunningStatisticsState in memory,
+    # or a plain dict when restored from an orbax checkpoint). The policy only
+    # ever sees the "state" observation group.
+    norm = params[0]
+    _mean = norm.mean if hasattr(norm, "mean") else norm["mean"]
+    _std = norm.std if hasattr(norm, "std") else norm["std"]
+    mean = _mean["state"]
+    std = _std["state"]
 
     # Convert mean/std jax arrays to tf tensors.
     mean_std = (tf.convert_to_tensor(mean), tf.convert_to_tensor(std))
@@ -147,7 +153,17 @@ def export_onnx(
 
         print("Weights transferred successfully.")
 
-    transfer_weights(params[1].policy["params"], tf_policy_network)
+    # params[1] holds the policy network params. In memory it is a policy object
+    # exposing `.policy`; when restored from an orbax checkpoint it is a plain
+    # dict shaped {'params': {'hidden_i': {'kernel','bias'}}}.
+    policy_params = params[1]
+    if hasattr(policy_params, "policy"):
+        policy_layers = policy_params.policy["params"]
+    elif isinstance(policy_params, dict) and "params" in policy_params:
+        policy_layers = policy_params["params"]
+    else:
+        policy_layers = policy_params
+    transfer_weights(policy_layers, tf_policy_network)
 
     # Example inputs for the model
     test_input = [np.ones((1, obs_size), dtype=np.float32)]

@@ -8,6 +8,7 @@ import argparse
 from playground.common.onnx_infer import OnnxInfer
 # from playground.common.poly_reference_motion_numpy import PolyReferenceMotion
 from playground.common.episodic_reference_motion_numpy import EpisodicReferenceMotion
+from playground.common.phase_encoding import gaussian_phase_np, DEFAULT_NUM_BASES
 from playground.common.utils import LowPassActionFilter
 
 from playground.open_duck_mini_v2.mujoco_infer_base import MJInferBase
@@ -34,7 +35,7 @@ class MjInfer(MJInferBase):
         self.action_filter = LowPassActionFilter(50, cutoff_frequency=37.5)
 
         if not self.standing:
-            self.ERM = EpisodicReferenceMotion("playground/open_duck_mini_v2/data/animation_data_leg_flexing.json")
+            self.ERM = EpisodicReferenceMotion("playground/open_duck_mini_v2/data/standing_wiggle.json")
 
         self.policy = OnnxInfer(onnx_model_path, awd=True)
 
@@ -53,7 +54,9 @@ class MjInfer(MJInferBase):
         self.commands = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
         self.imitation_i = 0
-        self.imitation_phase = np.array([0, 0])
+        self.num_bases = DEFAULT_NUM_BASES
+        # Monotonic phase encoded with N Gaussian bases (matches the training env).
+        self.imitation_phase = gaussian_phase_np(0.0, self.num_bases)
         self.saved_obs = []
 
         self.max_motor_velocity = 5.24  # rad/s
@@ -87,7 +90,7 @@ class MjInfer(MJInferBase):
                 gyro,
                 accelerometer,
                 # gravity,
-                command,
+                # FIX #3: no command in the episodic observation (paper Eq. 4).
                 joint_angles - self.default_actuator,
                 joint_vel * self.dof_vel_scale,
                 self.last_action,
@@ -95,9 +98,8 @@ class MjInfer(MJInferBase):
                 self.last_last_last_action,
                 self.motor_targets,
                 contacts,
-                # ref if not self.standing else np.array([]),
-                [self.imitation_i]
-                # self.imitation_phase,
+                # FIX #1: monotonic phase encoded with N=50 Gaussian bases.
+                self.imitation_phase,
             ]
         )
 
@@ -174,27 +176,14 @@ class MjInfer(MJInferBase):
 
                     if counter % self.decimation == 0:
                         if not self.standing:
+                            # FIX #1/#2: monotonic phase; restart the one-shot clip
+                            # when it finishes (phi == 1).
                             self.imitation_i += 1.0 * self.phase_frequency_factor
-                            self.imitation_i = (
-                                self.imitation_i % self.ERM.nb_steps
-                            )
-                            # print(self.PRM.nb_steps_in_period)
-                            # exit()
-                            self.imitation_phase = np.array(
-                                [
-                                    np.cos(
-                                        self.imitation_i
-                                        / self.ERM.nb_steps
-                                        * 2
-                                        * np.pi
-                                    ),
-                                    np.sin(
-                                        self.imitation_i
-                                        / self.ERM.nb_steps
-                                        * 2
-                                        * np.pi
-                                    ),
-                                ]
+                            if self.imitation_i >= self.ERM.nb_steps - 1:
+                                self.imitation_i = 0
+                            phi = self.imitation_i / (self.ERM.nb_steps - 1)
+                            self.imitation_phase = gaussian_phase_np(
+                                phi, self.num_bases
                             )
                         obs = self.get_obs(
                             self.data,

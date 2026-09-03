@@ -75,13 +75,25 @@ class BaseRunner(ABC):
         print(f"Saving checkpoint (step: {current_step}): {path}")
         orbax_checkpointer.save(path, params, force=True, save_args=save_args)
         onnx_export_path = f"{self.output_dir}/{d}_{current_step}.onnx"
-        export_onnx(
-            params,
-            self.action_size,
-            self.ppo_params,
-            self.obs_size,  # may not work
-            output_path=onnx_export_path
-        )
+        # In-loop ONNX export spins up a TensorFlow runtime that grabs several GB
+        # of GPU memory per checkpoint and can destabilise a long run on a shared
+        # GPU. It is best-effort anyway (the orbax checkpoint above is the source
+        # of truth). Set DISABLE_INLOOP_ONNX=1 to skip it and export offline.
+        if os.environ.get("DISABLE_INLOOP_ONNX") == "1":
+            return
+        try:
+            export_onnx(
+                params,
+                self.action_size,
+                self.ppo_params,
+                self.obs_size,  # may not work
+                output_path=onnx_export_path
+            )
+        except Exception as e:  # noqa: BLE001
+            # ONNX export is best-effort: the orbax checkpoint above is the
+            # source of truth. A TF/tf2onnx version mismatch must not kill a
+            # long training run; export can be re-run offline from checkpoints.
+            print(f"[warn] ONNX export failed at step {current_step}: {e}")
 
     def train(self) -> None:
         self.ppo_params = locomotion_params.brax_ppo_config(
@@ -99,6 +111,27 @@ class BaseRunner(ABC):
         else:
             network_factory = ppo_networks.make_ppo_networks
         self.ppo_training_params["num_timesteps"] = self.num_timesteps
+        # Optional footprint cap: on a shared GPU (e.g. a homelab with other
+        # containers) the default num_envs can OOM under transient contention,
+        # especially with the larger episodic observation. Allow an override.
+        _num_envs_override = os.environ.get("PPO_NUM_ENVS")
+        if _num_envs_override:
+            self.ppo_training_params["num_envs"] = int(_num_envs_override)
+        # Stabilization overrides for the episodic policy. The episodic optimal
+        # policy is nearly static (stand + small head wiggle), so the stock
+        # entropy bonus inflates the action std (observed 0.4 -> ~10 => the policy
+        # goes random and the robot falls). A huge initial value loss also drives a
+        # catastrophic first update. Allow tuning entropy_cost / learning_rate /
+        # reward_scaling from the environment so the walking defaults stay intact.
+        for _env_key, _param in (
+            ("PPO_ENTROPY_COST", "entropy_cost"),
+            ("PPO_LEARNING_RATE", "learning_rate"),
+            ("PPO_REWARD_SCALING", "reward_scaling"),
+            ("PPO_CLIPPING_EPSILON", "clipping_epsilon"),
+        ):
+            _v = os.environ.get(_env_key)
+            if _v:
+                self.ppo_training_params[_param] = float(_v)
         print(f"PPO params: {self.ppo_training_params}")
 
         train_fn = functools.partial(
