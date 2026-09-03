@@ -252,8 +252,18 @@ class Episodic(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             + dxy
         )  # x y noise
 
+        # FIX #4 (episodic): an episodic policy replays ONE specific clip (paper
+        # Eq. 4: x_t = f_epis(f_t, phi_t)) whose torso-orientation / world-velocity
+        # references are defined in a fixed world frame. The walking env spawns at a
+        # fully random yaw U(-pi, pi) because its command is expressed in the local
+        # frame, but for episodic imitation a random yaw makes the (non-yaw-invariant)
+        # orientation-tracking reward pure noise: the value function then sees wildly
+        # different returns for the same phase -> v_loss explodes (observed ~4e4),
+        # advantages become garbage and the policy erodes below its own init. Start
+        # near the clip's nominal orientation with only a small yaw perturbation for
+        # robustness.
         rng, key = jax.random.split(rng)
-        yaw = jax.random.uniform(key, (1,), minval=-3.14, maxval=3.14)
+        yaw = jax.random.uniform(key, (1,), minval=-0.1, maxval=0.1)
         quat = math.axis_angle_to_quat(jp.array([0, 0, 1]), yaw)
         new_quat = math.quat_mul(
             qpos[self._floating_base_qpos_addr + 3 : self._floating_base_qpos_addr + 7],
@@ -269,8 +279,13 @@ class Episodic(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         rng, key = jax.random.split(rng)
 
         # multiply actual joints with noise (excluding floating base and backlash)
+        # multiply actual joints with noise (excluding floating base and backlash).
+        # Episodic imitation needs most resets to start near the stable home pose so
+        # the policy can learn the stand+wiggle manifold instead of constantly
+        # recovering from near-fallen starts. The walking env used U(0.5, 1.5)
+        # (+/-50%, ~1/3 of seeds topple immediately); tighten to +/-10% here.
         qpos_j = self.get_actuator_joints_qpos(qpos) * jax.random.uniform(
-            key, (self._actuators,), minval=0.5, maxval=1.5
+            key, (self._actuators,), minval=0.9, maxval=1.1
         )
         qpos = self.set_actuator_joints_qpos(qpos_j, qpos)
         # print(f'DEBUG2 joint qpos: {qpos}')

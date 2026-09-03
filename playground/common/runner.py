@@ -117,6 +117,14 @@ class BaseRunner(ABC):
         _num_envs_override = os.environ.get("PPO_NUM_ENVS")
         if _num_envs_override:
             self.ppo_training_params["num_envs"] = int(_num_envs_override)
+        # Fewer evaluation points => fewer one-off eval-unroll XLA compilations,
+        # each of which is a transient GPU-memory spike. On a shared GPU those
+        # spikes can collide with another container's spike and get the process
+        # SIGKILLed (exit 137) even though steady-state memory fits. Allow the
+        # eval count (and thus spike frequency) to be tuned down.
+        _num_evals_override = os.environ.get("PPO_NUM_EVALS")
+        if _num_evals_override:
+            self.ppo_training_params["num_evals"] = int(_num_evals_override)
         # Stabilization overrides for the episodic policy. The episodic optimal
         # policy is nearly static (stand + small head wiggle), so the stock
         # entropy bonus inflates the action std (observed 0.4 -> ~10 => the policy
