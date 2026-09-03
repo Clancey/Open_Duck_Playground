@@ -5,10 +5,20 @@ import json
 
 
 class EpisodicReferenceMotion:
-    def __init__(self, ref_motion_path: str):
+    def __init__(self, ref_motion_path: str, amplitude_scale: float = 1.0):
         self.ref_motion = json.load(open(ref_motion_path, "r"))
         self.frames = jp.array(self.ref_motion["Frames"])
         self.nb_steps = len(self.ref_motion["Frames"])
+        # Amplitude curriculum knob. A full-amplitude standing wiggle is not
+        # balance-reachable from the stable home pose at preview budget (the
+        # policy topples ~step 26, before the shake window). Scaling every frame
+        # toward the static frame-0 yields a gentler, balance-feasible reference:
+        #   joints(i)   = joints(0)   + a * (joints(i)   - joints(0))
+        #   joints_vel  = a * joints_vel      (same motion, smaller excursion)
+        #   world_vel   = a * world_vel
+        # a = 1.0 reproduces the original clip exactly (default; nothing breaks).
+        self.amplitude_scale = float(amplitude_scale)
+        self._joints0 = self.frames[0][7 : 7 + 16]
 
     # ref_motion["Frames"][i]:
     # root_position
@@ -31,6 +41,12 @@ class EpisodicReferenceMotion:
         world_lin_vel_ang_vel = self.frames[i][
             29 : 29 + 6
         ]  # world linear vel + world angular vel
+        # Amplitude curriculum: shrink the excursion about the static frame-0 pose
+        # (a = 1.0 leaves the clip untouched).
+        a = self.amplitude_scale
+        joints_pos = self._joints0 + a * (joints_pos - self._joints0)
+        joints_vel = a * joints_vel
+        world_lin_vel_ang_vel = a * world_lin_vel_ang_vel
         frame = jp.concatenate(
             [
                 joints_pos,

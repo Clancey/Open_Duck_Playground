@@ -16,6 +16,7 @@
 """Episodic task for Open Duck Mini V2. (based on Berkeley Humanoid)"""
 
 from typing import Any, Dict, Optional, Union
+import os
 import jax
 import jax.numpy as jp
 from ml_collections import config_dict
@@ -147,7 +148,11 @@ class Episodic(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         ).ctrl  # ctrl of all the actual joints (no floating base and no backlash)
 
         if USE_IMITATION_REWARD:
-            self.ERM = EpisodicReferenceMotion(EPISODIC_CLIP)
+            # Amplitude curriculum knob (env var, default 1.0 = original clip).
+            # A gentler, balance-feasible reference lets the policy master balance
+            # before tracking the full-energy wiggle.
+            _amp = float(os.environ.get("REFERENCE_AMPLITUDE_SCALE", "1.0"))
+            self.ERM = EpisodicReferenceMotion(EPISODIC_CLIP, amplitude_scale=_amp)
             # One-shot clip: phase advances monotonically 0 -> 1 across the clip.
             # Phase rate is 1 / clip-duration (paper Section V-A): one frame per
             # control step (clip FPS == 1/ctrl_dt == 50), so phi hits 1 after exactly
