@@ -81,9 +81,16 @@ def default_config() -> config_dict.ConfigDict:
             scales=config_dict.create(
 
                 torques=-1.0e-3,
-                action_rate=-0.5,  # was -1.5
+                # FIX #5 (run13): sim eval of run12@33M showed the policy OVER-moves
+                # (motion ratio 6.56, saturated +/-1 actions) and falls at step 38 while
+                # the untrained baseline stands perfectly. Training drives it past the
+                # narrow "wiggle-while-balancing" target into flailing. Push every lever
+                # toward "stay upright, move gently": stronger action-rate (jerk) penalty
+                # to kill the saturated flailing, and halve imitation so the alive/balance
+                # reward dominates. Also reduces value-target variance -> steadier critic.
+                action_rate=-1.0,  # was -0.5 (flailing observed in sim)
                 alive=20.0,
-                imitation=1.0,
+                imitation=0.5,  # was 1.0 (over-moving; let balance dominate)
             ),
             tracking_sigma=0.01,  # was working at 0.01
             # Eq. 13 phase-windowed weight boost (Appendix A, paragraph 3). For the
