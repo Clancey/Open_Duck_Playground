@@ -96,6 +96,27 @@ class BaseRunner(ABC):
             print(f"[warn] ONNX export failed at step {current_step}: {e}")
 
     def train(self) -> None:
+        # Verify the XLA/JAX memory env vars actually reached THIS process (not
+        # just the `docker run -e` line). On a shared homelab GPU an unset
+        # PREALLOCATE causes JAX to grab ~90% of VRAM up front and then OOM on
+        # the next allocation; printing the live values makes that diagnosable
+        # from the training log instead of guessing.
+        _xla_env = {
+            k: os.environ.get(k, "<unset>")
+            for k in (
+                "XLA_PYTHON_CLIENT_PREALLOCATE",
+                "XLA_PYTHON_CLIENT_MEM_FRACTION",
+                "XLA_PYTHON_CLIENT_ALLOCATOR",
+            )
+        }
+        print(f"[env-check] XLA memory env inside training process: {_xla_env}")
+        try:
+            import jax as _jax
+
+            print(f"[env-check] jax devices: {_jax.devices()}")
+        except Exception as _e:  # noqa: BLE001
+            print(f"[env-check] could not query jax devices: {_e}")
+
         self.ppo_params = locomotion_params.brax_ppo_config(
             "BerkeleyHumanoidJoystickFlatTerrain"
         )  # TODO
